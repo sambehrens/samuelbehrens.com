@@ -109,6 +109,7 @@ const MAX_DUCKS = 2;
 const DUCK_SCALE = 2; // the duck is ~38 css px long at scale 1
 const DUCK_R = 24 * DUCK_SCALE; // rough radius of a duck, css px
 const DUCK_SPEED = 38; // average swimming speed, css px/s
+const DUCK_WAVE_PUSH = 600; // how hard waves push a duck (per unit of wave energy flux)
 // Duck cell parts (attr.w); +10 marks cells that ride on the bobbing head.
 const PART_BODY = 1;
 const PART_BILL = 2;
@@ -426,6 +427,49 @@ async function main() {
     [waveStep(waveB, waveA, true), waveStep(waveB, waveA, false)],
   ];
   let waveCur = 0; // which buffer holds the latest heights
+
+  // Waves push the ducks. A floating thing is carried the way waves travel,
+  // and for the wave equation that's the energy flux, -dh/dt * grad(h). Per
+  // duck: that flux (fast layer only: the cursor's waves; the slow layer is
+  // mostly the duck's own paddling) averaged over a disc around it, read
+  // back to the CPU, which steers the duck (see updateDucks).
+  const duckWave = instancedArray(MAX_DUCKS, "vec4"); // xy flux, z energy
+  const duckWavePass = (buf) =>
+    Fn(() => {
+      const duck = uDucks.element(instanceIndex);
+      const centre = duck.xy.add(uScroll);
+      const sum = vec4(0).toVar();
+      const cell = (qx, qy) => buf.element(max(min(qy, uWH.sub(1)), int(0)).mul(uWW).add(max(min(qx, uWW.sub(1)), int(0))));
+      Loop(81, ({ i }) => {
+        const off = vec2(float(i.mod(9)).sub(4), float(i.div(9)).sub(4)).mul(DUCK_R / 4.5);
+        const w = exp(dot(off, off).div(-((DUCK_R * 0.7) ** 2)));
+        const u = centre.add(off).sub(uWaveOrigin).div(WAVE_CELL);
+        const qx = int(floor(u.x));
+        const qy = int(floor(u.y));
+        If(qx.greaterThan(0).and(qx.lessThan(uWW.sub(1))).and(qy.greaterThan(0)).and(qy.lessThan(uWH.sub(1))), () => {
+          const c = cell(qx, qy).toVar();
+          const grad = vec2(cell(qx.add(1), qy).x.sub(cell(qx.sub(1), qy).x), cell(qx, qy.add(1)).x.sub(cell(qx, qy.sub(1)).x)).div(2 * WAVE_CELL);
+          const ht = c.x.sub(c.y).div(max(uWaveDt, 1e-4));
+          sum.addAssign(vec4(grad.mul(ht.negate()), c.x.mul(c.x), 1).mul(w));
+        });
+      });
+      duckWave.element(instanceIndex).assign(sum.div(max(sum.w, 1e-3)));
+    })().compute(MAX_DUCKS);
+  const duckWavePasses = [duckWavePass(waveA), duckWavePass(waveB)];
+  const duckPush = Array.from({ length: MAX_DUCKS }, () => ({ x: 0, y: 0, e: 0 }));
+  let duckWaveBusy = false;
+  const readDuckWaves = () => {
+    if (duckWaveBusy) return;
+    duckWaveBusy = true;
+    renderer
+      .getArrayBufferAsync(duckWave.value)
+      .then((ab) => {
+        const a = new Float32Array(ab);
+        for (let i = 0; i < MAX_DUCKS; i++) Object.assign(duckPush[i], { x: a[i * 4] || 0, y: a[i * 4 + 1] || 0, e: a[i * 4 + 2] || 0 });
+        if (params.has("duckwave")) window.__duckWave = duckPush.map((d) => ({ ...d }));
+      })
+      .finally(() => (duckWaveBusy = false));
+  };
 
   // Water height per layer (x fast, y slow) at a document point, bilinear,
   // plus each layer's slope.
@@ -1773,6 +1817,9 @@ async function main() {
       vx: 0,
       vy: 0,
       bend: 0,
+      dx: 0, // drift from waves
+      dy: 0,
+      startle: 0,
     });
     if (duckTest && i === 0) {
       // ?ducktest=x,y,heading (fractions of the view, radians) to aim it.
@@ -1787,6 +1834,28 @@ async function main() {
         if (d.wait <= 0 && !reduceMotion.matches) spawnDuck(d, i);
       } else {
         d.age += dt;
+        // Waves push the duck: the water's push (wave energy flux around it,
+        // from the GPU) drives a drift velocity that water drag slows down.
+        // A pushed duck turns to go with it, the more the harder it's
+        // pushed, and paddles a little faster for a moment, as if startled.
+        const w = duckPush[i];
+        let ax = w.x * DUCK_WAVE_PUSH;
+        let ay = w.y * DUCK_WAVE_PUSH;
+        const al = Math.hypot(ax, ay);
+        if (al > 160) {
+          ax *= 160 / al;
+          ay *= 160 / al;
+        }
+        const drag = Math.exp(-dt * 2.2);
+        d.dx = (d.dx + ax * dt) * drag;
+        d.dy = (d.dy + ay * dt) * drag;
+        const drift = Math.hypot(d.dx, d.dy);
+        if (drift > 2) {
+          const want = Math.atan2(d.dy, d.dx);
+          const diff = Math.atan2(Math.sin(want - d.base), Math.cos(want - d.base));
+          d.base += diff * Math.min(1, drift / 30) * (1 - Math.exp(-dt * 1.6));
+        }
+        d.startle = Math.max(d.startle * Math.exp(-dt * 0.8), Math.min(1, drift / 40));
         // Weave: a slow meander plus a quicker side-to-side.
         const sway = 0.7 * Math.sin(t * 0.45 + d.phase) + 0.35 * Math.sin(t * 1.15 + d.phase * 1.7);
         const before = d.heading;
@@ -1795,9 +1864,9 @@ async function main() {
         const turn = (d.heading - before) / Math.max(dt, 1e-3);
         d.bend += (Math.max(-0.012, Math.min(0.012, (turn / d.speed) * 0.9)) - d.bend) * (1 - Math.exp(-dt * 5));
         // Paddle-and-glide rhythm.
-        const v = d.speed * (0.8 + 0.25 * Math.sin(t * 2.2 + d.phase));
-        d.vx = Math.cos(d.heading) * v;
-        d.vy = Math.sin(d.heading) * v;
+        const v = d.speed * (0.8 + 0.25 * Math.sin(t * 2.2 + d.phase)) * (1 + 0.6 * d.startle);
+        d.vx = Math.cos(d.heading) * v + d.dx;
+        d.vy = Math.sin(d.heading) * v + d.dy;
         d.x += d.vx * dt;
         d.y += d.vy * dt;
         const m = DUCK_R * 2;
@@ -1811,7 +1880,7 @@ async function main() {
       if (d.active) {
         // (The shaders take ducks in viewport coordinates.)
         duckData[i].set(d.x - scrollX, d.y - scrollY, Math.cos(d.heading), Math.sin(d.heading));
-        if (duckTest && i === 0) window.__duck = { x: d.x - scrollX, y: d.y - scrollY };
+        if (duckTest && i === 0) window.__duck = { x: d.x - scrollX, y: d.y - scrollY, h: d.heading, dx: d.dx, dy: d.dy };
         duckVel[i].set(d.vx, d.vy, d.bend, 0);
       } else {
         duckData[i].set(-1e5, -1e5, 1, 0);
@@ -1912,6 +1981,7 @@ async function main() {
       waveWork.push(waveSteps[waveCur][k === 0 ? 0 : 1]);
       waveCur ^= 1;
     }
+    waveWork.push(duckWavePasses[waveCur]);
 
     if (gpuTime) {
       renderer.compute([...waveWork, facetUpdate, facetSpread]);
@@ -1921,6 +1991,7 @@ async function main() {
       renderer.compute([...waveWork, facetUpdate, facetSpread, fieldUpdate, nodeUpdate, pixelStage.clear, pixelStage.seed, pixelStage.padScatter, ...pixelStage.passes, pixelStage.neighbours, pixelStage.padEdgePass]);
     }
     uWaveReset.value = 0;
+    if (ducks.some((d) => d.active)) readDuckWaves();
     pixelStage.quad.render(renderer);
     pixelStage.pads.geometry.instanceCount = nodeCount;
     renderer.render(pixelStage.pads.scene, padCamera);

@@ -230,6 +230,20 @@ or flowers. Duck cells are narrow wedges, so they use much tighter rounding
 than pads (corner 0.16·r vs 0.45·r, gap 0.55 vs 1.4px, smooth-max 3 vs 8):
 with the pad values they shrank to scattered petals.
 
+**Waves steer ducks.** `duckWavePass` (after the wave steps, on the latest
+wave buffer) averages the fast layer's wave energy flux `-∂h/∂t·∇h` (the
+direction waves carry floating things) over a Gaussian disc around each duck
+into `duckWave`; the CPU reads it back asynchronously (`readDuckWaves`, one
+read in flight at a time, a frame or two late, no fps cost) into `duckPush`.
+`updateDucks` turns it into a drift velocity (`DUCK_WAVE_PUSH=600`, accel
+capped 160px/s², drag 2.2/s) added to the swimming velocity, turns the duck's
+base heading toward the drift (more the harder it's pushed), and adds a brief
+"startled" speed-up. Net: a quick stroke passing ~45px away nudges the duck
+~25px and it turns away from the disturbance over ~2s. Only the fast layer
+counts, because the slow layer is mostly the duck's own paddling.
+`?ducktest&duckwave` exposes the readback as `window.__duckWave`; `__duck`
+also has heading and drift. (A first try at 3000 shoved the duck ~400px.)
+
 Each cell springs to its spot in the duck's frame (head and bill bob; whole
 body bends by rotating each cell by `x × bend`, bend from turn rate) with the
 duck's velocity fed forward, so it holds shape but can be knocked apart.
