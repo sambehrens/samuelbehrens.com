@@ -29,7 +29,10 @@ slot's position / leader in `window.__ducks`; e.g.
 sends a raccoon in at 25%/50% heading right after 1.5s
 (`?raccoontest=x,y,heading`; `?ducktest&raccoontest=0.42,0.5,0` starts it
 just behind the test duck's brood, which makes a hunt within seconds; each
-`__ducks` entry then also has coon, mode, size, eaten, meals), `?gputime` turns
+`__ducks` entry then also has coon, mode, size, eaten, meals), `?flytest`
+sends a dragonfly in after 0.5s that keeps looking for pads (each perch's
+state in `window.__flies`, incl. why it last took off; `window.__splash(x,
+y, strength)` makes a splash at a viewport point), `?gputime` turns
 on GPU timestamp queries and puts `{c, r}` (compute / render ms, every 30
 frames) in `window.__gpu` (splits compute into three submissions). The
 bottom-right dev menu (`setupDevMenu()`) has an fps meter, debug toggle,
@@ -62,10 +65,9 @@ Node storage buffers (`instancedArray`, size `MAX_NODES = 2^17`):
   for pads, how far grown)
 - `lookBuf` what the cell looks like, resolved once per node per frame:
   x surface code (0 water, 1.x pad (fraction = wave lift, 0.45 level),
-  2..2.9 glyph (+hover darkening), 3 orange bar, 4.x duck body, 5.x duck bill, 6.x duckling body, 7.x raccoon fur, 8.x its tail rings / nose, 9.x its muzzle / ears, 10.x its eye patches (fraction = wave lift, like pads)),
+  2..2.9 glyph (+hover darkening), 3 orange bar, 4.x duck body, 5.x duck bill, 6.x duckling body, 7.x raccoon fur, 8.x its mask patches / tail rings / nose, 9.x its muzzle / ears (fraction = wave lift, like pads)),
   y spacing (**pad radius** for pads), z rnd (glyph / bar cells:
-  `floor(rnd·32) + wave lift`, since their x fraction is taken; a raccoon's
-  eye patch: where its eye is, packed), w tone
+  `floor(rnd·32) + wave lift`, since their x fraction is taken), w tone
   (glyph) / tint
 - `groupBuf` per DOM element: hover, darkens-on-hover, tones, bar ranges
 - `fieldBuf` mouse/duck wake field, 8px cells: x energy, yz flow,
@@ -91,7 +93,8 @@ raccoon); `uDrops` (click splashes: document pos, start time, strength).
 ## Per-frame pipeline (`renderer.setAnimationLoop`)
 
 CPU: dt, scroll, mouse → wake uniforms; smoothed **water cursor**; hover
-easing → `groupBuf`; `updateDucks()`; wave grid anchor / substeps. Then one
+easing → `groupBuf`; `updateDucks()`; `updateFlies()`; wave grid anchor /
+substeps. Then one
 `renderer.compute([...])`:
 
 1. (`wavePadPass` if the wave grid moved) → `waveStep` × substeps (1 at
@@ -121,6 +124,9 @@ easing → `groupBuf`; `updateDucks()`; wave grid anchor / substeps. Then one
    its 8 nearest power bisectors, gathered from the block lists of a 5×5
    grid of blocks 12px apart, stored in `padData` (5 vec4s/pad) as the 6
    nearest edge lines `(normal, offset)` plus the flower's room.
+9. `flyProbe` — one thread per dragonfly: the lily pad under a point it
+   asks about (from `padBlock`) and where a watched pad is and how fast it
+   moves, into `flyOut`, read back to the CPU (see Dragonflies).
 
 Then a full-screen `QuadMesh` with `shade()`:
 - Candidates are **streamed** (`forEachCandidate`, read twice, never stored —
@@ -215,7 +221,8 @@ scattered blobs, not as the pads' clean cells.
 
 Palettes in `PALETTES.light/dark` (water, pads, petals, ripple, text=cream,
 accent=#ffb82b used for underlines, duck bill, flower centres; duckling
-yellow; raccoon grey `raccoon`, `raccoonDark` and `raccoonPale`). Colours are
+yellow; raccoon grey `raccoon`, `raccoonDark` and `raccoonPale`; dragonfly
+orange-red `fly`, `flyDark`, clear `flyWing`). Colours are
 sRGB values (`outputColorSpace = LinearSRGBColorSpace`, no conversion).
 
 ## Text
@@ -352,22 +359,19 @@ Owner asked for raccoons as cute as the ducks that hunt ducklings and
 **Look** (`coonCells`, `RACCOON_SCALE=1.8`, ~120 css px long, bigger than a
 duck): a chubby round back; a big head; and a bushy tail of five
 alternating dark / fur rings (dark tip) floating out behind. The face is
-built from the front: two dark **eye patches** (surface code 10), each with
-a round dark eye and a white glint toward the light drawn by `padShader`
-(the eye's offset from the cell's centre, `COON_EYE` rotated to the
-raccoon's heading, is packed into lookBuf.z by nodeUpdate, since only the
-front / outer part of a patch is visible), then a short pale muzzle and a
-button nose; behind them a smaller grey crown with a big round pale ear at
-each back corner. Tail cells carry +20 in attr.w and **wag** in a slow wave
-that runs down the tail, swinging more toward the tip; head cells (+10)
-sniff side to side. Designed in a 2D power-diagram prototype first (same
-cell / rounding rules, rendered per pixel on a 2D canvas):
+built from the front: two plain dark mask patches, then a short pale
+muzzle and a button nose; behind them a smaller grey crown with a big round
+pale ear at each back corner. Tail cells carry +20 in attr.w and **wag** in
+a slow wave that runs down the tail, swinging more toward the tip; head
+cells (+10) sniff side to side. Designed in a 2D power-diagram prototype
+first (same cell / rounding rules, rendered per pixel on a 2D canvas):
 thin, evenly spaced tail rings and a small head read as a caterpillar; tail
 rings spaced closer than their radius read as one striped tail. Owner asked
 for a cuter face than the first one (mask cells poking out past the crown
-like horns, small ears, a long snout, no eyes); patches placed inside a big
-crown cell lose the power diagram and shrink to slivers, hence the
-front-built face. The eyes made the biggest difference.
+like horns, small ears, a long snout); patches placed inside a big crown
+cell lose the power diagram and shrink to slivers, hence the front-built
+face. Pupils with white glints drawn in the patches were then rejected:
+they didn't match the simple blob style (keep every animal to flat blobs).
 
 **Behaviour** (`updateCoon`, CPU; real raccoons swim well but slowly, head
 up, tail floating, and do take ducklings): it comes in from an edge like a
@@ -407,6 +411,53 @@ lunges with near misses (stalk 1.05× never got close; without the sneaky
 stalk every lunge missed); naturally, the first raccoon arrived at 34s,
 caught one duckling and left at ~95s. 120fps headful, ~+0.1ms compute.
 
+## Dragonflies (`MAX_FLIES=3`)
+
+Owner asked for dragonflies that fly in, land on lily pads, wait a random
+time and fly off, with a small ripple when they land and take off, flying
+off when their pad is disturbed; then for a very gentle ripple, a more
+natural path than straight lines, and a simpler design.
+
+**Look** (`flyMesh`, drawn in the lily pad pass's scene after the pads,
+over everything): as simple and cute as the ducks, two chubby blobs in
+flat colour with the cells' lit rim (top left) and thin darker edge (a big
+round head, a short teardrop body) and four round clear petal wings spread
+in an X (SDFs in the fragment shader, one quad per slot, in units of
+`FLY_SIZE=1.3`px). Flying, the wings beat (foreshorten and fade, fore and
+hind out of step, 26Hz); perched, they lie flat. A soft shadow down-right,
+further and softer the higher it flies (`FLY_ALT=24`px); a little bigger
+when high. Perched, the vertex stage places it at its pad's live `siteBuf`
+position plus its spot, so it rides the pad's sway exactly. (Too detailed,
+and rejected: a first take with segment bands, wing veins, tip spots and
+eye glints; then two eye beads, a thorax and a long thin abdomen. Designed
+in a 2D SDF prototype. Its own render pass cost ~2ms of GPU at Retina size:
+hence drawn in the pad pass.)
+
+**Flight** (`updateFly`, CPU, document px; real dragonflies fly direct but
+not ruler-straight): darts along a **bowed path** (`startDart`: a quadratic
+curve bent 10–30% of its length to a random side, eased in and out over
+`distance / 300–420px/s`, with a slight sideways flutter mid-dart) that it
+follows on a stiff spring (`flyAlong`), facing its motion; then a dead stop
+and a hover (0.3–1.3s, bobbing, glancing about). Modes: `dart`, `hover`,
+`approach`, `land`, `perched`, `takeoff`, `leave`.
+
+**Pads.** The CPU can't see pads, so while hovering a dragonfly asks
+`flyProbe` about a random point within ~240px each frame (`uFlyAsk.xy`);
+answers (a frame or two late) give a pad's id, centre and radius (pads with
+a flower, or not fully grown, are skipped; one already taken by another
+dragonfly too). It darts over the pad (tracking it via `uFlyAsk.z`, the
+watched pad), settles onto a spot within 0.3 of its radius (0.45s: shadow
+draws in, wings slow) with a tiny-drop ripple round the rim, and sits
+`FLY_PERCH` 4–14s. **Disturbed:** after 1.2s (its own ripple settles), it
+measures the watched pad: moving faster than `FLY_SPOOK=16`px/s or drifting
+`FLY_SHIFT=5`px from where it settled (that rest point creeps with the pads'
+slow wander), or no longer a pad, sends it off (a farther dart) with
+another ripple. A relayout (`layoutGen`) changes node ids, so it lets go.
+Tested: a click 120px away sends it off ~0.55s later (as the ring reaches
+it); one 300px away doesn't; left alone it sits its full time. After 1–3
+pads (or 75s) it sweeps off out of view. Spawning: first after 5–10s, then
+every `FLY_EVERY` 14–32s while a slot is free.
+
 ## Ripples (wave simulation + mosaic)
 
 **Simulation** (`waveStep`): leapfrog damped wave equation on a 4px grid
@@ -443,6 +494,16 @@ that), which leaves lazy rings lingering where it landed. `DROP_PUSH=[110,
 and push ducks (wave flux) like any other wave. A single half-sine push gave
 one thin, faint ring; 60 read too weak for a "large" wave. No fps cost.
 
+**Tiny drops** (`TINY_DROP`; strength < 0, packed as `-(radius + amount)`,
+radius in whole px, amount in [0, 1)): one quick soft push (0.2s,
+`sigma=6`) into the **slow layer only**, along a circle of that radius, so
+a gentle ring rises and fades nearby. Used by dragonflies around their
+pad's rim (`FLY_SPLASH=0.1`). A scaled-down click splash (0.1) was far too
+big (fast rings across the page); a centred tiny push looked delayed (the
+slow ring took ~0.5s to surface from under the pad); pushing along the rim
+shows at once (it carries ~4× the energy of a centred one, hence the small
+amount).
+
 **Mosaic** (`facetUpdate` / `facetSpread` / shade): the water is a jittered
 grid Voronoi of `FACET=9px` cells, fixed to the page and invisible while calm.
 Per mosaic cell (compute, ~16k cells): centre (+ sway down the slope, capped
@@ -467,6 +528,9 @@ blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
 - Ducks: with the packed duck loops, the 76-slot pool times the same as the
   old 10-slot one, and a pond packed full (12 ducks, ~48 ducklings, up to
   ~47 on screen) still holds 120fps at ~+0.2ms compute.
+- Every extra `renderer.render()` is a full-screen render pass: the
+  dragonflies' own pass cost ~2ms GPU at Retina size, inside the pad pass
+  they cost ~nothing. Add new overlays to the pad pass's scene.
 - Fragment shader size matters for every pixel (register pressure / occupancy):
   rarely-taken but big branches (pad + flower code) cost ~1.5ms for all
   pixels; move such work into its own pass.
@@ -514,7 +578,8 @@ and ripples affecting the letters (see Letter styling); ducklings in a line
 behind about half the ducks, separable, swimming back to the nearest duck
 (see Ducklings); more ducks / ducklings that feel unlimited with
 interaction (see Ducks); cute raccoons that hunt and swallow ducklings and
-that ducks avoid (see Raccoons).
+that ducks avoid (see Raccoons); dragonflies that land on pads with very
+gentle ripples, curved natural flight, simple style (see Dragonflies).
 Liked: blobby rounded ripple cells, V wakes (esp. duck wakes and fast cursor
 strokes), clustered pads, Voronoi-cell pads (some bigger, a little Voronoi
 irregularity is fine; veins, lit rim), flowers, ducks parting pads, ducks drawn in the pad style, letters with the same lit
@@ -528,4 +593,6 @@ speckle in the water, erratic slow-stroke ripples, ripples too strong for
 slow strokes, duck ripples faster than the duck, jagged/stair-stepped lily
 pads, overlapping non-Voronoi pads, pads disappearing near ducks, complete
 pads flying in during the intro,
-ducks jumping when scrolling, glitchy/specky edges, blurry particles.
+ducks jumping when scrolling, glitchy/specky edges, blurry particles,
+fine detail on the animals (pupils with glints, wing veins, segment bands):
+keep them simple flat blobs.

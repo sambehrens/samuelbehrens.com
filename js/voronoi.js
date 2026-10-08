@@ -107,6 +107,13 @@ const DROP_PUSH = [110, 8]; // fast, slow layer
 const DROP_SIGMA = 16; // css px, width of the splash
 const DROP_FREQ = 3; // Hz the fast push swings at (a train of a few rings)
 const DROP_TIME = 0.8; // s, how long the fast push lasts (the slow one: a quarter)
+// A tiny drop (e.g. a dragonfly touching down on a lily pad): one quick,
+// soft push into the slow layer only, so a gentle ring rises and fades
+// nearby instead of racing across the pond. It pushes along a circle (the
+// pad's rim), so the ring shows at once rather than surfacing from under
+// the pad half a second later. Passed as strength -(radius + amount), with
+// the radius in whole px and the amount in [0, 1).
+const TINY_DROP = { sigma: 6, push: 8, time: 0.2 };
 const PAD_SWAY = 60; // how far pads sway with passing waves (px per unit slope)
 const TEXT_SWAY = 18; // how far letters' cells sway with passing waves (px per unit slope)
 const TEXT_SWAY_MAX = 2; // css px, cap on a letter cell's sway (keeps letters legible)
@@ -146,6 +153,19 @@ const RACCOON_CATCH = 19; // css px from its mouth: caught
 const RACCOON_FULL = 3; // ducklings until it's full and leaves
 const RACCOON_GROW = 0.07; // how much rounder it gets per duckling
 const RACCOON_PADDLE = 7;
+// Dragonflies dart about over the pond (quick straight darts, dead stops to
+// hover and pivot), now and then settle on a lily pad, sit a while with
+// their wings spread flat, and lift off again; a ripple marks each touch
+// down and take-off, and a pad that moves under one (a ripple, a duck, the
+// cursor's wake) sends it off at once. They fly over everything.
+const MAX_FLIES = 3;
+const FLY_EVERY = [14, 32]; // s between arrivals (the first after 5-10 s)
+const FLY_PERCH = [4, 14]; // s it sits on a pad, if left alone
+const FLY_SPLASH = 0.1; // the gentle ripple it makes landing and taking off (a tiny drop around its pad's rim, see TINY_DROP)
+const FLY_SPOOK = 16; // css px/s: a pad moving this fast sends it off
+const FLY_SHIFT = 5; // css px: ...or moved this far since it landed
+const FLY_ALT = 24; // css px it flies above the water (sets its shadow)
+const FLY_SIZE = 1.3; // (its shapes are drawn in units of this many css px)
 const DUCKLING_FEAR = 115; // css px: ducklings flee a raccoon this close
 const DUCK_WARY = 170; // css px: ducks turn away from a raccoon this close
 const BROOD_CHANCE = 0.5;
@@ -167,7 +187,6 @@ const PART_CHICK = 3; // a duckling's (yellow) body
 const PART_FUR = 4; // a raccoon's grey fur
 const PART_MASK = 5; // its dark mask, tail rings and nose
 const PART_PALE = 6; // its pale muzzle and ears
-const PART_EYE = 7; // a dark eye patch with a shiny eye in it
 
 // A duck, top-down, is a handful of big weighted cells drawn like the lily
 // pads (see padShader): a tail, two pairs of body cells (the seam down the
@@ -199,13 +218,14 @@ const chickCells = (() => {
 })();
 // A raccoon, swimming: a chubby round back, a big head and a bushy tail of
 // alternating fur and dark rings that floats out behind and wags. The face
-// is built from the front: two dark eye patches (each with a shiny eye, see
-// padShader) and a short pale muzzle with a button nose, in front of a
-// smaller crown with a big round pale ear at each back corner. (Cells
-// inside a bigger one lose the power diagram and shrink to slivers, so the
-// patches can't sit on top of the crown; patches poking out past it looked
-// like horns. Tail rings narrower than their radius, so it reads as one
-// striped tail, not a row of beads; a smaller head read as a caterpillar.)
+// is built from the front: two plain dark mask patches and a short pale
+// muzzle with a button nose, in front of a smaller crown with a big round
+// pale ear at each back corner. (Cells inside a bigger one lose the power
+// diagram and shrink to slivers, so the patches can't sit on top of the
+// crown; patches poking out past it looked like horns; pupils with glints
+// in the patches didn't match the simple blob style. Tail rings narrower
+// than their radius, so it reads as one striped tail, not a row of beads; a
+// smaller head read as a caterpillar.)
 const coonCells = (() => {
   const S = RACCOON_SCALE;
   const T = 20; // (tail)
@@ -220,17 +240,13 @@ const coonCells = (() => {
     { x: 6.8, y: 0, r: 7.9, part: PART_FUR + H },
     { x: 2.6, y: -8.4, r: 4.3, part: PART_PALE + H },
     { x: 2.6, y: 8.4, r: 4.3, part: PART_PALE + H },
-    { x: 13.4, y: -4.5, r: 4.3, part: PART_EYE + H },
-    { x: 13.4, y: 4.5, r: 4.3, part: PART_EYE + H },
+    { x: 13.4, y: -4.5, r: 4.3, part: PART_MASK + H },
+    { x: 13.4, y: 4.5, r: 4.3, part: PART_MASK + H },
     { x: 17.6, y: 0, r: 3.7, part: PART_PALE + H },
     { x: 20.9, y: 0, r: 2.1, part: PART_MASK + H },
   ].map((c) => ({ x: c.x * S, y: c.y * S, r: c.r * S, part: c.part }));
 })();
 const COON_MOUTH = 20 * RACCOON_SCALE; // css px ahead of its centre
-// Where the eye sits in its patch (forward, toward the middle; css px) and
-// its size (x the patch's radius). The visible bit of a patch is its front
-// and outer side, so the eye is nudged there to sit wholly inside it.
-const COON_EYE = { fwd: 0.9 * RACCOON_SCALE, inward: 0.35 * RACCOON_SCALE, size: 0.5 };
 const COON_TAIL = -12 * RACCOON_SCALE; // where its tail starts to wag
 const isChickSlot = (i) => i >= FIRST_CHICK;
 const isCoonSlot = (i) => i >= FIRST_COON && i < FIRST_CHICK;
@@ -271,6 +287,9 @@ const PALETTES = {
     raccoon: "#aaa49b",
     raccoonDark: "#45413d",
     raccoonPale: "#efe9de",
+    fly: "#ec5b2c",
+    flyDark: "#7a2414",
+    flyWing: "#f1f7ff",
   },
   dark: {
     water: "#0f3149",
@@ -290,6 +309,9 @@ const PALETTES = {
     raccoon: "#8f8a83",
     raccoonDark: "#302d2b",
     raccoonPale: "#ddd6c9",
+    fly: "#d9552d",
+    flyDark: "#5c1d10",
+    flyWing: "#d6e4f0",
   },
 };
 
@@ -402,6 +424,24 @@ async function main() {
       const slot = int(info.x);
       body({ slot, size: uDuckVel.element(slot).w, pick: (a, b, c) => select(coon, float(c), select(chick, float(b), float(a))) });
     });
+  // Dragonflies (one entry per slot). A: viewport xy, heading, height above
+  // the water (css px). B: x the lily pad it's sitting on (node id, -1 =
+  // flying), yz its spot on that pad (from the pad's centre; the pass draws
+  // it on the pad wherever the pad is), w how hard its wings beat (0 still,
+  // 1 flying; -1 = slot unused).
+  const flyA = Array.from({ length: MAX_FLIES }, () => new THREE.Vector4());
+  const flyB = Array.from({ length: MAX_FLIES }, () => new THREE.Vector4(-1, 0, 0, -1));
+  const uFlyA = uniformArray(flyA, "vec4");
+  const uFlyB = uniformArray(flyB, "vec4");
+  // What each dragonfly asks the GPU about pads (see flyProbe): xy a
+  // viewport point to look for a pad under (off screen = none), z a pad to
+  // watch (node id, -1 = none).
+  const flyAsk = Array.from({ length: MAX_FLIES }, () => new THREE.Vector4(-1e5, -1e5, -1, 0));
+  const uFlyAsk = uniformArray(flyAsk, "vec4");
+  // ...and its answers, read back to the CPU: [2i] the pad found under the
+  // point (id or -1, document xy, radius), [2i+1] the watched pad (document
+  // xy, speed, its id, or -2 if it's no longer a pad, -1 if none asked).
+  const flyOut = instancedArray(MAX_FLIES * 2, "vec4");
   // Wave grid (viewport-sized, anchored to the document so waves scroll
   // with the page): size, the document position of cell (0,0)'s corner, how
   // many cells the anchor moved since last frame, the per-substep timestep
@@ -447,6 +487,9 @@ async function main() {
     raccoon: uRaccoon,
     raccoonDark: uRaccoonDark,
     raccoonPale: uRaccoonPale,
+    fly: uFly,
+    flyDark: uFlyDark,
+    flyWing: uFlyWing,
   } = palette;
 
   const applyPalette = () => {
@@ -598,10 +641,15 @@ async function main() {
         const fade = float(1).sub(clamp(age.div(DROP_TIME), 0, 1));
         const swing = sin(age.mul(Math.PI * 2 * DROP_FREQ)).mul(fade.mul(fade));
         const soft = sin(clamp(age.div(DROP_TIME / 4), 0, 1).mul(Math.PI));
-        const dd = c.sub(drop.xy);
-        const q = dot(dd, dd).div(2 * DROP_SIGMA * DROP_SIGMA);
-        const shape = float(1).sub(q).mul(exp(q.negate())).mul(drop.w);
-        force.addAssign(dropForce.mul(vec2(swing, soft)).mul(shape));
+        const tiny = drop.w.lessThan(0);
+        const sigma = select(tiny, float(TINY_DROP.sigma), float(DROP_SIGMA));
+        // (A tiny drop's profile runs across its circle, not out from the
+        // middle.)
+        const across = length(c.sub(drop.xy)).sub(select(tiny, floor(abs(drop.w)), float(0)));
+        const q = across.mul(across).div(sigma.mul(sigma).mul(2));
+        const shape = float(1).sub(q).mul(exp(q.negate())).mul(select(tiny, fract(abs(drop.w)), drop.w));
+        const tinyPush = sin(clamp(age.div(TINY_DROP.time), 0, 1).mul(Math.PI)).mul((WAVE_SPEED[1] ** 2 * TINY_DROP.push) / TINY_DROP.sigma ** 2);
+        force.addAssign(select(tiny, vec2(0, tinyPush), dropForce.mul(vec2(swing, soft))).mul(shape));
       }
       // Ducks: the body presses a dent that travels with it (a moving dent
       // makes a wake), and the paddling feet behind it pulse.
@@ -1018,7 +1066,7 @@ async function main() {
     const lifted = clamp(lift.mul(0.35).add(0.45), 0.02, 0.9);
     const surface = select(
       isDuck,
-      part.add(3).add(lifted), // 4 body / 5 bill / 6 duckling body / 7 raccoon fur / 8 its mask / 9 its muzzle / 10 its eye patch
+      part.add(3).add(lifted), // 4 body / 5 bill / 6 duckling body / 7 raccoon fur / 8 its mask / 9 its muzzle
       select(
         isInk,
         float(2).add(hover.mul(G.y).mul(0.9)),
@@ -1034,13 +1082,7 @@ async function main() {
     // (For a pad or duck cell, y is its radius.)
     // (For glyph and bar cells, z packs the water's lift into its fraction:
     // floor(rnd * 32) + lifted.)
-    // (For a raccoon's eye patch, z packs where the eye is, from the cell's
-    // centre in screen px: x and y in quarter px, offset by 16 px.)
-    const eyeLocal = vec2(COON_EYE.fwd, sign(Hm.y).mul(-COON_EYE.inward)).mul(slotSize);
-    const eyeOff = clamp(duck.zw.mul(eyeLocal.x).add(vec2(duck.w.negate(), duck.z).mul(eyeLocal.y)), -15, 15);
-    const eyePack = floor(eyeOff.x.add(16).mul(4).add(0.5)).mul(256).add(floor(eyeOff.y.add(16).mul(4).add(0.5)));
-    const isEye = isDuck.and(part.greaterThan(PART_EYE - 0.5));
-    const lookRnd = select(isInk.or(inBar), floor(rnd.mul(32)).add(lifted), select(isEye, eyePack, rnd));
+    const lookRnd = select(isInk.or(inBar), floor(rnd.mul(32)).add(lifted), rnd);
     lookBuf.element(instanceIndex).assign(vec4(surface, select(isPadNode, padR, spacing), lookRnd, extra));
   })().compute(MAX_NODES);
 
@@ -1287,18 +1329,51 @@ async function main() {
       });
     })().compute(MAX_NODES);
 
+    // Dragonflies' questions about pads (see uFlyAsk): the lily pad under a
+    // point, if any (one with no flower, fully grown: its id, centre and
+    // radius), and where a watched pad is now and how fast it's moving.
+    const padBlockRO = ro(padBlock, "uint", blockCap);
+    const flyProbe = Fn(() => {
+      const i = int(instanceIndex);
+      const ask = uFlyAsk.element(i);
+      const bx = int(floor(ask.x));
+      const by = int(floor(ask.y));
+      const found = vec4(-1, 0, 0, 0).toVar();
+      If(bx.greaterThanEqual(0).and(bx.lessThan(uW)).and(by.greaterThanEqual(0)).and(by.lessThan(uH)), () => {
+        const key = padBlockRO.element(by.div(2).mul(uNW).add(bx.div(2)));
+        If(key.notEqual(uint(0xffffffff)), () => {
+          const id = int(key.bitAnd(uint(0x1ffff)));
+          const look = lookBuf.element(id);
+          const site = siteBuf.element(id);
+          const flower = fract(look.z.mul(7.31)).lessThan(FLOWER_FRACTION);
+          If(floor(look.x).equal(1).and(flower.not()).and(site.w.greaterThan(0.95)), () => {
+            found.assign(vec4(float(id), site.xy, look.y.mul(site.w)));
+          });
+        });
+      });
+      flyOut.element(i.mul(2)).assign(found);
+      const watched = vec4(0, 0, 0, -1).toVar();
+      const w = int(ask.z);
+      If(w.greaterThanEqual(0), () => {
+        const site = siteBuf.element(w);
+        const ok = floor(lookBuf.element(w).x).equal(1);
+        watched.assign(vec4(site.xy, length(posBuf.element(w).zw), select(ok, float(w), float(-2))));
+      });
+      flyOut.element(i.mul(2).add(1)).assign(watched);
+    })().compute(MAX_FLIES);
+
     const material = new THREE.MeshBasicNodeMaterial();
     material.colorNode = shade(ro(nbr, "ivec4", blockCap), ro(slots, "int", capacity * SLOTS), ro(padBlock, "uint", blockCap));
 
     const pads = padShader(ro(padData, "vec4", MAX_NODES * 5));
 
-    return { capacity, clear, seed, padScatter, passes, neighbours, padEdgePass, pads, quad: new THREE.QuadMesh(material) };
+    return { capacity, clear, seed, padScatter, passes, neighbours, padEdgePass, flyProbe, pads, quad: new THREE.QuadMesh(material) };
   };
 
 
   // Lily pads and duck cells ("leaves") are weighted cells drawn by the pad
   // pass; surface codes 1 (pad), 4 (duck body), 5 (bill), 6 (duckling body),
-  // 7-10 (raccoon fur, mask, muzzle, eye patch).
+  // 7-9 (raccoon fur, mask, muzzle).
   const isLeafCode = (x) => {
     const code = floor(x);
     return code.equal(1).or(code.greaterThan(3.5));
@@ -1350,8 +1425,7 @@ async function main() {
           const isBill = floor(look.x).equal(5);
           const isChick = floor(look.x).equal(6);
           const isFur = floor(look.x).equal(7);
-          const isEye = floor(look.x).equal(10);
-          const isMask = floor(look.x).equal(8).or(isEye);
+          const isMask = floor(look.x).equal(8);
           const isPale = floor(look.x).equal(9);
           const base = id.mul(5);
           const pe2 = float(1e6).toVar();
@@ -1423,16 +1497,6 @@ async function main() {
           leafCol.assign(mix(leafCol, select(facing.greaterThan(0), light, shade), rimBand.mul(abs(facing)).mul(0.45)));
           // ...and a thin darker edge.
           leafCol.assign(mix(leafCol, edgeCol, smoothstep(-1.6, 0, shape)));
-          // A raccoon's eye: a dark round pupil in its patch with a white
-          // glint toward the light (top left).
-          If(isEye, () => {
-            const eye = vec2(floor(rnd.div(256)), mod(rnd, 256)).div(4).sub(16);
-            const pr = r.mul(COON_EYE.size);
-            const de = length(rel.sub(eye));
-            leafCol.assign(mix(leafCol, vec3(0.07, 0.06, 0.06), float(1).sub(smoothstep(pr.sub(aa), pr.add(aa), de))));
-            const dg = length(rel.sub(eye.add(vec2(-0.6, -0.8).mul(pr.mul(0.42)))));
-            leafCol.assign(mix(leafCol, vec3(1), float(1).sub(smoothstep(pr.mul(0.32).sub(aa), pr.mul(0.32).add(aa), dg))));
-          });
           sCol.assign(leafCol);
           sFill.assign(fill);
 
@@ -1478,6 +1542,123 @@ async function main() {
     scene.add(mesh);
     return { scene, geometry };
   };
+
+  // ---------------------------------------------------- render: dragonflies
+
+  // A dragonfly, top-down, as simple and cute as the ducks: two chubby
+  // blobs in flat colour, each with the same lit rim (top left) and thin
+  // darker edge as the pads' and ducks' cells (a big round head, a short
+  // teardrop body), and four round clear petal wings spread in an X.
+  // Flying, the wings beat into a shimmer (they foreshorten and fade, fore
+  // and hind pairs out of step); perched, they lie flat and still. Its
+  // shadow falls on the water down and to the right, further and softer the
+  // higher it is. One quad per slot, drawn over everything, in the lily pad
+  // pass (its own render pass cost ~2ms at Retina size). (A first take
+  // with segment bands, wing veins, tip spots and eye glints was too
+  // detailed next to the ducks; so was a second with two eye beads, a
+  // thorax and a long thin abdomen.)
+  const flyMesh = (() => {
+    const material = new THREE.MeshBasicNodeMaterial({ transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide }); // (y is flipped into screen space)
+    const A = uFlyA.element(instanceIndex);
+    const B = uFlyB.element(instanceIndex);
+    // (Perched, it rides its pad: drawn at the pad's spot, wherever the pad
+    // has swayed to this frame.)
+    const pad = siteRO.element(max(int(B.x), int(0)));
+    const at = select(B.x.greaterThanEqual(0), pad.xy.sub(uScroll).add(B.yz), A.xy);
+    const reach = A.w.mul(0.006).add(1).mul(25).add(A.w.mul(0.8)).add(4);
+    const corner = at.add(positionGeometry.xy.mul(reach));
+    material.vertexNode = select(
+      B.w.greaterThanEqual(0),
+      vec4(corner.x.div(float(uW)).mul(2).sub(1), float(1).sub(corner.y.div(float(uH)).mul(2)), 0, 1),
+      vec4(2, 2, 2, 1), // (unused slot: off screen)
+    );
+    const vRel = varying(positionGeometry.xy.mul(reach));
+    const vFly = varying(vec4(A.z, A.w, B.w, float(instanceIndex)));
+    material.colorNode = Fn(() => {
+      const alt = vFly.y;
+      const flap = vFly.z;
+      const hx = cos(vFly.x);
+      const hy = sin(vFly.x);
+      const aa = float(0.7).div(uDpr);
+      // (A little bigger the higher it flies.)
+      const g = alt.mul(0.006).add(1).mul(FLY_SIZE);
+      // Screen offset -> its own frame: x forward, y to its right, px.
+      const toLocal = (q) => vec2(dot(q, vec2(hx, hy)), dot(q, vec2(hy.negate(), hx))).div(g);
+      // (The light, top left on screen, in its frame.)
+      const light = vec2(dot(vec2(-0.6, -0.8), vec2(hx, hy)), dot(vec2(-0.6, -0.8), vec2(hy.negate(), hx)));
+      const ellipse = (q, c, u, L, W) => {
+        const d = q.sub(c);
+        return length(vec2(dot(d, u).div(L), dot(d, vec2(u.y.negate(), u.x)).div(W))).sub(1).mul(min(L, W));
+      };
+      // Body pieces: distance and the outward direction (for the rim light).
+      const disc = (q, c, r) => ({ d: length(q.sub(c)).sub(r), n: normalize(q.sub(c).add(vec2(1e-4, 0))) });
+      const taper = (q, a, b, r0, r1) => {
+        const pa = q.sub(a);
+        const ba = b.sub(a);
+        const h = clamp(dot(pa, ba).div(dot(ba, ba)), 0, 1);
+        const off = pa.sub(ba.mul(h));
+        return { d: length(off).sub(mix(r0, r1, h)), n: normalize(off.add(vec2(1e-4, 0))) };
+      };
+      const pieces = (q) => [
+        { ...taper(q, vec2(2, 0), vec2(-10, 0), float(3.2), float(1.5)), col: vec3(uFly) },
+        { ...disc(q, vec2(6.4, 0), 3.8), col: mix(vec3(uFly), uFlyDark, 0.45) },
+      ];
+      // Wings: fore pair, then hind pair; beating, each foreshortens (and
+      // fades) through its stroke.
+      const beat = (lag) => mix(float(1), abs(cos(uTime.mul(Math.PI * 2 * 26).add(vFly.w.mul(1.7)).add(lag))).mul(0.5).add(0.5), flap);
+      const wings = [
+        { root: vec2(2.4, 0), dx: 0.5, L: 6.2, W: 3.3, lag: 0 },
+        { root: vec2(-0.2, 0), dx: -0.4, L: 5.8, W: 3.3, lag: Math.PI / 2 },
+      ].flatMap((w) =>
+        [-1, 1].map((side) => {
+          const u = normalize(vec2(w.dx, side));
+          const L = beat(w.lag).mul(w.L);
+          return (q) => ellipse(q, w.root.add(u.mul(L)), u, L, float(w.W));
+        }),
+      );
+
+      const pc = vec3(0).toVar(); // (premultiplied)
+      const a = float(0).toVar();
+      const over = (col, al) => {
+        pc.assign(col.mul(al).add(pc.mul(float(1).sub(al))));
+        a.assign(al.add(a.mul(float(1).sub(al))));
+      };
+
+      // Shadow on the water (or the pad it sits on).
+      const blur = alt.mul(0.06).add(0.5);
+      const sq = toLocal(vRel.sub(vec2(0.45, 0.75).mul(alt.mul(0.55).add(1.2))));
+      const shadowBody = pieces(sq).map((p) => p.d).reduce((x, y) => min(x, y));
+      const shadowWing = wings.map((w) => w(sq)).reduce((x, y) => min(x, y));
+      over(vec3(0.02, 0.08, 0.14), max(float(1).sub(smoothstep(blur.negate(), blur, shadowBody)).mul(0.26), float(1).sub(smoothstep(blur.negate(), blur, shadowWing)).mul(0.1)));
+
+      const q = toLocal(vRel).toVar();
+      // Wings: plain and clear, a touch brighter at the edge; fainter (a
+      // blur) while beating.
+      for (const w of wings) {
+        const d = w(q);
+        const cover = float(1).sub(smoothstep(aa.negate(), aa, d));
+        over(vec3(uFlyWing), mix(float(0.42), float(0.7), smoothstep(-1, -0.2, d)).mul(float(1).sub(flap.mul(0.55))).mul(cover));
+      }
+      // Body: each piece flat, its rim lit on the light's side and shaded on
+      // the other, with a thin darker edge.
+      for (const p of pieces(q)) {
+        const facing = dot(p.n, light);
+        const rim = smoothstep(-2.2, -0.5, p.d);
+        const col = mix(p.col, select(facing.greaterThan(0), mix(p.col, vec3(1), 0.45), p.col.mul(0.8)), rim.mul(abs(facing)).mul(0.5)).toVar();
+        col.assign(mix(col, p.col.mul(0.72), smoothstep(-0.8, 0, p.d)));
+        over(col, float(1).sub(smoothstep(aa.negate(), aa, p.d)));
+      }
+
+      return vec4(pc.div(max(a, 1e-4)), a);
+    })();
+    const geometry = new THREE.InstancedBufferGeometry().copy(new THREE.PlaneGeometry(2, 2));
+    geometry.instanceCount = MAX_FLIES;
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 1; // (after the pads)
+    mesh.visible = false;
+    return mesh;
+  })();
 
   // ------------------------------------------------------- render: shading
 
@@ -1800,6 +1981,7 @@ async function main() {
   const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
 
   let nodeCount = 0;
+  let layoutGen = 0; // (bumped by every layout: node ids change)
   let firstLayout = true;
 
   const layout = () => {
@@ -1993,6 +2175,7 @@ async function main() {
     homeBuf.value.needsUpdate = true;
     attrBuf.value.needsUpdate = true;
     nodeCount = n;
+    layoutGen++;
     nodeUpdate.count = n;
     if (pixelStage) pixelStage.seed.count = pixelStage.padEdgePass.count = pixelStage.padScatter.count = n;
     writeGroups(true);
@@ -2052,6 +2235,7 @@ async function main() {
         return;
       }
       pixelStage = buildPixelStage(Math.min(Math.ceil(Math.max(w * h, screen.width * screen.height) * 1.05), maxCells));
+      pixelStage.pads.scene.add(flyMesh); // (dragonflies ride in the pad pass)
       pixelStage.seed.count = pixelStage.padEdgePass.count = pixelStage.padScatter.count = nodeCount;
     }
     uNW.value = Math.ceil(w / 2);
@@ -2089,7 +2273,8 @@ async function main() {
   addEventListener("blur", deactivate);
   addEventListener("pointerup", (e) => e.pointerType === "touch" && deactivate());
   // A click or tap splashes the water (the oldest splash slot is reused).
-  // (Document px; strength 1 is a click's.)
+  // (Document px; strength 1 is a click's; negative, a tiny drop, see
+  // TINY_DROP.)
   let nextDrop = 0;
   const splash = (x, y, strength) => {
     dropData[nextDrop].set(x, y, uTime.value, strength);
@@ -2726,6 +2911,290 @@ async function main() {
     }
   };
 
+  // ------------------------------------------------------------ dragonflies
+
+  // (See MAX_FLIES.) Each comes in from an edge and darts about: a quick
+  // spring to a point, a dead stop, a hover (bobbing, glancing about), the
+  // next dart. While hovering it looks for a lily pad, asking the GPU what's
+  // under random points nearby (flyProbe; answers arrive a frame or two
+  // later); given a free one it darts over it, settles onto it (wings
+  // slowing, shadow drawing in) with a small ripple and sits FLY_PERCH s,
+  // riding the pad. It watches the pad (flyProbe again) and is off at once,
+  // with another ripple, if the pad moves faster than FLY_SPOOK or drifts
+  // FLY_SHIFT from where it settled (a ripple, a duck shoving it, the
+  // cursor's wake) or stops being a pad (relayout). After 1-3 pads it leaves.
+  const flyTest = params.has("flytest");
+  if (flyTest) window.__splash = (x, y, w) => splash(x + scrollX, y + scrollY, w);
+  const flies = Array.from({ length: MAX_FLIES }, () => ({ active: false }));
+  let nextFly = flyTest ? 0.5 : between(5, 10);
+  let flyBusy = false;
+  const readFlies = () => {
+    if (flyBusy) return;
+    flyBusy = true;
+    renderer
+      .getArrayBufferAsync(flyOut.value)
+      .then((ab) => {
+        const o = new Float32Array(ab);
+        const now = performance.now();
+        flies.forEach((f, i) => {
+          if (!f.active) return;
+          const k = i * 8;
+          if (o[k] >= 0 && f.looking) f.found = { id: o[k], x: o[k + 1], y: o[k + 2], r: o[k + 3], t: now, gen: layoutGen };
+          f.watch = { x: o[k + 4], y: o[k + 5], speed: o[k + 6], id: o[k + 7] };
+        });
+      })
+      .finally(() => (flyBusy = false));
+  };
+  // A dart from where it is to (tx, ty) at about `speed` px/s. Real
+  // dragonflies fly direct but not ruler-straight: each dart bows into a
+  // gentle arc (to a random side), speeds up and slows down, and flutters a
+  // little sideways on the way.
+  const startDart = (f, tx, ty, speed, maxTime = 1.4) => {
+    const d = Math.hypot(tx - f.x, ty - f.y);
+    Object.assign(f, {
+      sx: f.x,
+      sy: f.y,
+      tx,
+      ty,
+      bow: (Math.random() < 0.5 ? -1 : 1) * between(0.1, 0.3),
+      dartT: 0,
+      dartFor: Math.min(Math.max(d / speed, 0.3), maxTime),
+    });
+  };
+  // Somewhere lo-hi px away to dart to, in view.
+  const pickDart = (f, lo, hi) => {
+    const m = 50;
+    for (let k = 0; k < 12; k++) {
+      const a = Math.random() * Math.PI * 2;
+      const d = between(lo, hi);
+      const tx = f.x + Math.cos(a) * d;
+      const ty = f.y + Math.sin(a) * d;
+      if (tx > scrollX + m && tx < scrollX + innerWidth - m && ty > scrollY + m && ty < scrollY + innerHeight - m) {
+        startDart(f, tx, ty, between(300, 420));
+        return;
+      }
+    }
+    startDart(f, scrollX + innerWidth * between(0.2, 0.8), scrollY + innerHeight * between(0.2, 0.8), between(300, 420));
+  };
+  const spawnFly = (f) => {
+    const w = route(40);
+    Object.assign(f, {
+      active: true,
+      age: 0,
+      x: w.x,
+      y: w.y,
+      vx: 0,
+      vy: 0,
+      heading: w.heading,
+      alt: FLY_ALT,
+      mode: "dart",
+      modeT: 0,
+      pad: -1, // the pad it's sitting on
+      target: -1, // the pad it's going for
+      ox: 0, // its spot on the pad
+      oy: 0,
+      found: null,
+      watch: null,
+      looking: false,
+      perches: 0,
+      maxPerches: flyTest ? 9 : 1 + Math.floor(Math.random() * 3),
+      phase: Math.random() * 100,
+    });
+    pickDart(f, 150, 300);
+  };
+  // Along the dart: a point that eases along the bowed path (a quadratic
+  // curve), which the dragonfly follows on a stiff spring. Returns how far
+  // it still is from the end.
+  const flyAlong = (f, dt, k = 90, cap = 560) => {
+    f.dartT += dt;
+    const k1 = Math.min(f.dartT / f.dartFor, 1);
+    const u = k1 * k1 * (3 - 2 * k1);
+    const dx = f.tx - f.sx;
+    const dy = f.ty - f.sy;
+    // (The curve's middle control point: off to one side of the straight
+    // line, by `bow` of its length; plus a little flutter mid-dart.)
+    const flutter = Math.sin(f.dartT * 13 + f.phase) * 1.5 * Math.sin(u * Math.PI);
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len;
+    const ny = dx / len;
+    const cx = f.sx + dx / 2 + nx * f.bow * len;
+    const cy = f.sy + dy / 2 + ny * f.bow * len;
+    const px = (1 - u) * (1 - u) * f.sx + 2 * u * (1 - u) * cx + u * u * f.tx + nx * flutter;
+    const py = (1 - u) * (1 - u) * f.sy + 2 * u * (1 - u) * cy + u * u * f.ty + ny * flutter;
+    const c = 2 * Math.sqrt(k) * 0.9;
+    f.vx += ((px - f.x) * k - f.vx * c) * dt;
+    f.vy += ((py - f.y) * k - f.vy * c) * dt;
+    const sp = Math.hypot(f.vx, f.vy);
+    if (sp > cap) {
+      f.vx *= cap / sp;
+      f.vy *= cap / sp;
+    }
+    f.x += f.vx * dt;
+    f.y += f.vy * dt;
+    return Math.hypot(f.tx - f.x, f.ty - f.y);
+  };
+  const faceMotion = (f, dt) => {
+    if (Math.hypot(f.vx, f.vy) > 50) f.heading += angleTo(Math.atan2(f.vy, f.vx), f.heading) * (1 - Math.exp(-dt * 16));
+  };
+  const setFly = (f, mode) => {
+    f.mode = mode;
+    f.modeT = 0;
+  };
+  // (A gentle ring around the rim of the pad it's on.)
+  const padRipple = (f) => splash(f.x - f.ox, f.y - f.oy, -(Math.max(1, Math.round(f.padR * 0.9)) + FLY_SPLASH));
+  const takeOff = (f, startled) => {
+    f.why = `${startled ? "spooked" : "rested"} after ${f.modeT.toFixed(1)}s`;
+    if (f.pad >= 0) padRipple(f);
+    f.pad = -1;
+    f.target = -1;
+    f.perches++;
+    pickDart(f, startled ? 160 : 90, startled ? 300 : 220);
+    setFly(f, "takeoff");
+  };
+  // (Follow the pad it's going for or sitting on, from the GPU's answers.)
+  const padNow = (f, id) => (f.watch && f.watch.id === id ? f.watch : null);
+  const updateFly = (f, i, dt, t) => {
+    f.age += dt;
+    f.modeT += dt;
+    f.looking = false;
+    let ask = -1; // (the pad to watch)
+    let probe = null; // (a viewport point to look for a pad under)
+    if ((f.pad >= 0 || f.target >= 0) && f.gen !== layoutGen) {
+      // The page was laid out again: pads have new ids.
+      if (f.pad >= 0) takeOff(f, true);
+      else {
+        startDart(f, f.x, f.y, 300);
+        setFly(f, "hover");
+        f.hoverFor = 0.3;
+      }
+      f.target = -1;
+    }
+    if (f.mode === "dart" || f.mode === "takeoff") {
+      const left = flyAlong(f, dt);
+      faceMotion(f, dt);
+      if (f.mode === "takeoff") {
+        f.alt = FLY_ALT * Math.min(1, f.modeT / 0.3) ** 0.5;
+        if (f.modeT > 0.3) setFly(f, "dart");
+      } else if (f.dartT >= f.dartFor && left < 3 && Math.hypot(f.vx, f.vy) < 30) {
+        setFly(f, "hover");
+        f.hoverFor = between(0.3, 1.3);
+      }
+    } else if (f.mode === "hover") {
+      flyAlong(f, dt);
+      // (Glancing about.)
+      f.heading += Math.sin(t * 2.3 + f.phase) * 0.9 * dt;
+      const wants = f.perches < f.maxPerches && f.age < 75;
+      if (wants) {
+        f.looking = true;
+        const a = Math.random() * Math.PI * 2;
+        const d = between(20, 240);
+        probe = [f.x + Math.cos(a) * d - scrollX, f.y + Math.sin(a) * d - scrollY];
+      }
+      if (f.modeT > f.hoverFor) {
+        const p = f.found;
+        const fresh = p && wants && performance.now() - p.t < 800 && p.gen === layoutGen && !flies.some((o) => o !== f && o.active && (o.pad === p.id || o.target === p.id));
+        if (fresh) {
+          // Settle a little off the pad's centre.
+          const a = Math.random() * Math.PI * 2;
+          const rr = p.r * 0.3 * Math.random();
+          Object.assign(f, { target: p.id, gen: layoutGen, padR: p.r, ox: Math.cos(a) * rr, oy: Math.sin(a) * rr });
+          startDart(f, p.x + f.ox, p.y + f.oy, between(260, 360));
+          f.found = null;
+          setFly(f, "approach");
+        } else if (!wants) {
+          // Off out of the pond, in one long sweep.
+          const a = Math.random() * Math.PI * 2;
+          startDart(f, f.x + Math.cos(a) * 1600, f.y + Math.sin(a) * 1600, 340, 30);
+          setFly(f, "leave");
+        } else {
+          pickDart(f, 70, 240);
+          setFly(f, "dart");
+        }
+      }
+    } else if (f.mode === "approach" || f.mode === "land") {
+      ask = f.target;
+      const w = padNow(f, f.target);
+      if (f.watch && f.watch.id === -2) {
+        // (It stopped being a pad.)
+        f.target = -1;
+        f.alt = FLY_ALT;
+        startDart(f, f.x, f.y, 300);
+        setFly(f, "hover");
+        f.hoverFor = 0.3;
+      } else {
+        if (w) {
+          // (The pad drifts: the dart ends wherever it is now.)
+          f.tx = w.x + f.ox;
+          f.ty = w.y + f.oy;
+        }
+        const left = flyAlong(f, dt, f.mode === "land" ? 120 : 90);
+        if (f.mode === "approach") {
+          faceMotion(f, dt);
+          if (f.dartT >= f.dartFor && left < 2.5 && Math.hypot(f.vx, f.vy) < 25) setFly(f, "land");
+        } else {
+          // Settling down: the shadow draws in under it, the wings slow.
+          const k = Math.min(1, f.modeT / 0.45);
+          f.alt = FLY_ALT * (1 - k * k * (3 - 2 * k));
+          if (k >= 1) {
+            f.alt = 0;
+            f.pad = f.target;
+            f.target = -1;
+            f.base = null;
+            f.perchFor = between(...FLY_PERCH);
+            padRipple(f);
+            setFly(f, "perched");
+          }
+        }
+      }
+    } else if (f.mode === "perched") {
+      ask = f.pad;
+      const w = padNow(f, f.pad);
+      if (f.watch && f.watch.id === -2) takeOff(f, true);
+      else if (w) {
+        f.x = w.x + f.ox;
+        f.y = w.y + f.oy;
+        // (Its own landing ripple settles first; after that it measures
+        // drift from where the pad has come to rest, which itself creeps
+        // with the pads' slow ambient wander.)
+        if (f.modeT < 1.2 || !f.base) f.base = { x: w.x, y: w.y };
+        else {
+          const k = 1 - Math.exp(-dt * 0.3);
+          f.base.x += (w.x - f.base.x) * k;
+          f.base.y += (w.y - f.base.y) * k;
+          const spooked = w.speed > FLY_SPOOK || Math.hypot(w.x - f.base.x, w.y - f.base.y) > FLY_SHIFT;
+          if (spooked || f.modeT > f.perchFor) takeOff(f, spooked);
+        }
+      }
+    } else if (f.mode === "leave") {
+      flyAlong(f, dt, 60);
+      faceMotion(f, dt);
+      if (f.age > 2 && offScreen(f, 80)) f.active = false;
+    }
+    flyAsk[i].set(probe ? probe[0] : -1e5, probe ? probe[1] : -1e5, ask, 0);
+  };
+  const updateFlies = (dt, t) => {
+    nextFly -= dt;
+    if (nextFly <= 0) {
+      const f = flies.find((o) => !o.active);
+      if (f) spawnFly(f);
+      nextFly = between(...FLY_EVERY);
+    }
+    flies.forEach((f, i) => {
+      if (f.active) updateFly(f, i, dt, t);
+      if (!f.active) {
+        flyB[i].set(-1, 0, 0, -1);
+        flyAsk[i].set(-1e5, -1e5, -1, 0);
+        return;
+      }
+      // (A hovering one bobs a little.)
+      const bob = f.mode === "hover" ? 1 : 0;
+      flyA[i].set(f.x - scrollX + Math.sin(t * 3.1 + f.phase) * 1.2 * bob, f.y - scrollY + Math.sin(t * 4.3 + f.phase * 2) * 1.2 * bob, f.heading, f.alt);
+      const flap = f.mode === "perched" ? 0 : f.mode === "land" ? 1 - Math.min(1, f.modeT / 0.45) : 1;
+      flyB[i].set(f.mode === "perched" ? f.pad : -1, f.ox, f.oy, flap);
+    });
+    if (flyTest) window.__flies = flies.map((f) => f.active && { x: f.x - scrollX, y: f.y - scrollY, mode: f.mode, pad: f.pad, target: f.target, perches: f.perches, why: f.why, watch: f.watch && { ...f.watch }, base: f.base && { ...f.base } });
+  };
+
   // ------------------------------------------------------------------- loop
 
   let last = performance.now();
@@ -2793,6 +3262,7 @@ async function main() {
     for (const g of groups) g.hover += (g.target - g.hover) * ease;
     writeGroups(false);
     updateDucks(dt, uTime.value);
+    updateFlies(dt, uTime.value);
 
     // Waves: as few steps per frame as the fast layer's stability limit
     // allows (one at 120fps, two at 60fps); a step is capped at that limit,
@@ -2823,14 +3293,16 @@ async function main() {
     if (gpuTime) {
       renderer.compute([...waveWork, facetUpdate, facetSpread]);
       renderer.compute([fieldUpdate, nodeUpdate]);
-      renderer.compute([pixelStage.clear, pixelStage.seed, pixelStage.padScatter, ...pixelStage.passes, pixelStage.neighbours, pixelStage.padEdgePass]);
+      renderer.compute([pixelStage.clear, pixelStage.seed, pixelStage.padScatter, ...pixelStage.passes, pixelStage.neighbours, pixelStage.padEdgePass, pixelStage.flyProbe]);
     } else {
-      renderer.compute([...waveWork, facetUpdate, facetSpread, fieldUpdate, nodeUpdate, pixelStage.clear, pixelStage.seed, pixelStage.padScatter, ...pixelStage.passes, pixelStage.neighbours, pixelStage.padEdgePass]);
+      renderer.compute([...waveWork, facetUpdate, facetSpread, fieldUpdate, nodeUpdate, pixelStage.clear, pixelStage.seed, pixelStage.padScatter, ...pixelStage.passes, pixelStage.neighbours, pixelStage.padEdgePass, pixelStage.flyProbe]);
     }
     uWaveReset.value = 0;
     if (ducks.some((d) => d.active)) readDuckWaves();
+    if (flies.some((f) => f.active)) readFlies();
     pixelStage.quad.render(renderer);
     pixelStage.pads.geometry.instanceCount = nodeCount;
+    flyMesh.visible = flies.some((f) => f.active);
     renderer.render(pixelStage.pads.scene, padCamera);
     if (gpuTime && (gpuFrame = (gpuFrame || 0) + 1) % 30 === 0) {
       Promise.all([renderer.resolveTimestampsAsync(THREE.TimestampQuery.COMPUTE), renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER)]).then(([c, r]) => {
