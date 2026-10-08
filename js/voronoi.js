@@ -186,11 +186,18 @@ main().catch((err) => {
 
 async function main() {
   if (params.has("nofx") || !navigator.gpu) return;
-  if (!(await navigator.gpu.requestAdapter())) return;
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return;
 
   const canvas = document.getElementById("fx");
   const gpuTime = params.has("gputime");
-  const renderer = new THREE.WebGPURenderer({ canvas, antialias: false, trackTimestamp: gpuTime });
+  // The per-pixel grid outgrows WebGPU's default 128MB buffer limit on big
+  // screens (4K at 1x), so ask for whatever the adapter allows.
+  const requiredLimits = {
+    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+    maxBufferSize: adapter.limits.maxBufferSize,
+  };
+  const renderer = new THREE.WebGPURenderer({ canvas, antialias: false, trackTimestamp: gpuTime, requiredLimits });
   await renderer.init();
   if (!renderer.backend.isWebGPUBackend) return;
 
@@ -819,9 +826,13 @@ async function main() {
 
   let pixelStage = null;
 
+  // capacity: grid cells (css px); the jump flood, neighbour lists and pad
+  // blocks are per 2x2 block, so they get a quarter of that (plus the odd
+  // edge row and column).
   const buildPixelStage = (capacity) => {
-    const jfaA = instancedArray(capacity, "int");
-    const jfaB = instancedArray(capacity, "int");
+    const blockCap = Math.ceil(capacity / 4) + 8192;
+    const jfaA = instancedArray(blockCap, "int");
+    const jfaB = instancedArray(blockCap, "int");
     const slotCount = instancedArray(capacity, "uint").toAtomic();
     const slots = instancedArray(capacity * SLOTS, "int");
     // Per 2x2 block, the lily pad nearest its centre by power distance among
@@ -829,7 +840,7 @@ async function main() {
     // so atomicMin picks it (0xffffffff = none). The pixel shader adds it as
     // a candidate, so a pad is never missed (the block lists can miss a heavy
     // pad whose centre is far off).
-    const padBlock = instancedArray(capacity, "uint").toAtomic();
+    const padBlock = instancedArray(blockCap, "uint").toAtomic();
 
     const clear = Fn(() => {
       If(int(instanceIndex).lessThan(uNW.mul(uNH)), () => {
@@ -904,7 +915,7 @@ async function main() {
           }
         }
         dst.element(idx).assign(best);
-      })().compute(capacity);
+      })().compute(blockCap);
 
     const passes = [];
     let src = jfaA;
@@ -919,7 +930,7 @@ async function main() {
     // wider rings so neighbours a corner-radius away are found too. The
     // pixel shader then only has to rank these exactly.
     const jfa = src;
-    const nbr = instancedArray(capacity, "ivec4");
+    const nbr = instancedArray(blockCap, "ivec4");
     const neighbours = Fn(() => {
       const idx = int(instanceIndex);
       const bx = idx.mod(uNW).mul(2); // the block's top-left cell
@@ -983,7 +994,7 @@ async function main() {
         If(inGrid(qx, qy), () => consider(jfa.element(qy.div(2).mul(uNW).add(qx.div(2)))));
       });
       nbr.element(idx).assign(ivec4(ids[0], ids[1], ids[2], ids[3]));
-    })().compute(capacity);
+    })().compute(blockCap);
 
 
     // Lily pads show every edge of their cell (water cells are invisible), so
@@ -1055,7 +1066,7 @@ async function main() {
     })().compute(MAX_NODES);
 
     const material = new THREE.MeshBasicNodeMaterial();
-    material.colorNode = shade(ro(nbr, "ivec4", capacity), ro(slots, "int", capacity * SLOTS), ro(padBlock, "uint", capacity));
+    material.colorNode = shade(ro(nbr, "ivec4", blockCap), ro(slots, "int", capacity * SLOTS), ro(padBlock, "uint", blockCap));
 
     const pads = padShader(ro(padData, "vec4", MAX_NODES * 5));
 
@@ -1744,7 +1755,9 @@ async function main() {
 
   // ----------------------------------------------------------------- sizing
 
+  let tooBig = false; // the view outgrew the GPU's buffers: effect off for good
   const resize = () => {
+    if (tooBig) return;
     const dpr = Math.min(devicePixelRatio || 1, 2);
     const w = Math.ceil(innerWidth);
     const h = Math.ceil(innerHeight);
@@ -1768,7 +1781,20 @@ async function main() {
     facetUpdate.count = facetSpread.count = uFacetW.value * uFacetH.value;
 
     if (!pixelStage || w * h > pixelStage.capacity) {
-      pixelStage = buildPixelStage(Math.ceil(Math.max(w * h, screen.width * screen.height) * 1.05));
+      // Room for the whole screen (so maximizing doesn't rebuild), within the
+      // device's buffer limit (the slot grid is the biggest buffer). A view
+      // too big for the device turns the effect off rather than erroring.
+      const { maxStorageBufferBindingSize, maxBufferSize } = renderer.backend.device.limits;
+      const maxCells = Math.floor(Math.min(maxStorageBufferBindingSize, maxBufferSize) / (4 * SLOTS));
+      if (w * h > maxCells) {
+        console.warn(`Voronoi: ${w}x${h} view is too big for this GPU's buffers; effect disabled`);
+        tooBig = true;
+        renderer.setAnimationLoop(null);
+        canvas.style.display = "none";
+        root.classList.remove("fx-on");
+        return;
+      }
+      pixelStage = buildPixelStage(Math.min(Math.ceil(Math.max(w * h, screen.width * screen.height) * 1.05), maxCells));
       pixelStage.seed.count = pixelStage.padEdgePass.count = pixelStage.padScatter.count = nodeCount;
     }
     uNW.value = Math.ceil(w / 2);
@@ -1780,6 +1806,7 @@ async function main() {
   };
 
   resize();
+  if (tooBig) return;
   layout();
 
   let layoutTimer = 0;

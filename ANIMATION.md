@@ -327,6 +327,13 @@ blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
 - Keep the fragment shader's register use low; prefer per-node / per-facet
   work in compute passes over per-pixel work.
 - Per-stage storage-buffer limit is 8 (nodeUpdate is at it).
+- **Buffer size limit**: the slot grid (`SLOTS` ints per css px) is the
+  biggest buffer, ~139MB on a 4K screen at 1x, over WebGPU's default 128MB.
+  `main()` requests the adapter's own `maxStorageBufferBindingSize` /
+  `maxBufferSize`; `resize()` sizes the pixel stage for the whole screen (+5%)
+  capped at what the device allows, and turns the effect off (plain page)
+  if the view itself won't fit. The jump-flood, neighbour-list and pad-block
+  buffers are per 2×2 block (`blockCap`, a quarter of the pixels).
 - If the owner has the site open in their own Chrome, it shares the GPU and
   headful benchmarks read low (~90fps) for every version: compare against a
   backup in the same session before concluding something got slower.
