@@ -6,8 +6,8 @@
 //      by the cursor and the ducks' paddling feet, and a mouse wake field is
 //      splatted along the cursor's path,
 //   2. each node is pulled toward its home by a spring, wanders on Perlin noise,
-//      gets kicked by turbulence wherever the wake is strong, and (pads, ducks)
-//      sways with the waves; background nodes also live, die and respawn,
+//      gets kicked by turbulence wherever the wake is strong, and (pads, ducks,
+//      letters) sways with the waves; background nodes also live, die and respawn,
 //   3. the nodes are scattered into a css-pixel grid (up to SLOTS per cell, so
 //      dense small text keeps every seed) and a jump-flood pass finds each
 //      cell's nearest node,
@@ -108,7 +108,9 @@ const DROP_SIGMA = 16; // css px, width of the splash
 const DROP_FREQ = 3; // Hz the fast push swings at (a train of a few rings)
 const DROP_TIME = 0.8; // s, how long the fast push lasts (the slow one: a quarter)
 const DUCK_PRESS = 0;
-const PAD_SWAY = 60; // how far pads sway with passing waves (px per unit slope) // how deep a duck's body dents the water
+const PAD_SWAY = 60; // how far pads sway with passing waves (px per unit slope)
+const TEXT_SWAY = 18; // how far letters' cells sway with passing waves (px per unit slope)
+const TEXT_SWAY_MAX = 2; // css px, cap on a letter cell's sway (keeps letters legible)
 const DUCK_PADDLE = 6; // how hard its feet paddle
 const FACET = 9; // css px, size of the water mosaic's cells
 const MAX_DUCKS = 2;
@@ -331,6 +333,16 @@ async function main() {
       .and(fy.lessThan(uFH));
     const cell = max(min(fy, uFH.sub(1)), int(0)).mul(uFW).add(max(min(fx, uFW.sub(1)), int(0)));
     return select(inside, buf.element(cell), vec4(0));
+  };
+  // The water's height (fieldBuf.w), bilinear between field cell centres, so
+  // neighbouring small cells (letters) get smoothly varying slopes instead of
+  // 8px steps.
+  const fieldHeight = (vp) => {
+    const g = vp.div(FIELD_CELL).sub(0.5);
+    const g0 = floor(g);
+    const t = g.sub(g0);
+    const at = (dx, dy) => sampleField(fieldBuf, g0.add(vec2(dx + 0.5, dy + 0.5)).mul(FIELD_CELL)).w;
+    return mix(mix(at(0, 0), at(1, 0), t.x), mix(at(0, 1), at(1, 1), t.x), t.y);
   };
 
   // ------------------------------------------------- compute: water waves
@@ -762,20 +774,22 @@ async function main() {
     // Pads ride the waves: they sway with the water (drawn offset down its
     // slope, like the water's own back-and-forth under a passing ripple),
     // get a gentle push, and catch the light on crests (see lookBuf below).
-    // Ducks bob along a little too.
-    const swell = vec2(0).toVar();
-    const lift = float(0).toVar();
-    If(isBg.or(isDuck), () => {
-      const vp = p.sub(uScroll);
-      const e = sampleField(fieldBuf, vp.add(vec2(FIELD_CELL, 0))).w.toVar();
-      const w = sampleField(fieldBuf, vp.sub(vec2(FIELD_CELL, 0))).w.toVar();
-      const s = sampleField(fieldBuf, vp.add(vec2(0, FIELD_CELL))).w.toVar();
-      const n = sampleField(fieldBuf, vp.sub(vec2(0, FIELD_CELL))).w.toVar();
-      const slope = vec2(e.sub(w), s.sub(n)).div(2 * FIELD_CELL);
-      swell.assign(slope.mul(select(isDuck, float(-0.35 * PAD_SWAY), float(-PAD_SWAY))));
-      lift.assign(e.add(w).add(s).add(n).mul(0.25));
-      acc.addAssign(slope.mul(select(isDuck, float(0), float(-900))));
-    });
+    // Ducks bob along a little too. Letters (and their halo / plate cells,
+    // so whole letters move together) waver as a ripple passes under them,
+    // like text seen through moving water: a capped sway, no push, so they
+    // stay legible and settle back as soon as the water calms.
+    const isText = isBg.or(isDuck).not();
+    const vp = p.sub(uScroll);
+    const e = fieldHeight(vp.add(vec2(FIELD_CELL, 0))).toVar();
+    const w = fieldHeight(vp.sub(vec2(FIELD_CELL, 0))).toVar();
+    const s = fieldHeight(vp.add(vec2(0, FIELD_CELL))).toVar();
+    const n = fieldHeight(vp.sub(vec2(0, FIELD_CELL))).toVar();
+    const slope = vec2(e.sub(w), s.sub(n)).div(2 * FIELD_CELL).toVar();
+    const lift = e.add(w).add(s).add(n).mul(0.25).toVar();
+    const swayRaw = slope.mul(select(isDuck, float(-0.35 * PAD_SWAY), select(isBg, float(-PAD_SWAY), float(-TEXT_SWAY)))).toVar();
+    const swayLen = length(swayRaw);
+    const swell = select(isText, swayRaw.mul(min(swayLen, TEXT_SWAY_MAX).div(max(swayLen, 1e-4))), swayRaw);
+    acc.addAssign(slope.mul(select(isBg, float(-900), float(0))));
 
     v.addAssign(acc.mul(uDt));
     p.addAssign(v.mul(uDt));
@@ -819,7 +833,10 @@ async function main() {
     );
     const extra = select(isInk, mix(G.z, G.w, hover), tint);
     // (For a pad or duck cell, y is its radius.)
-    lookBuf.element(instanceIndex).assign(vec4(surface, select(isPadNode, padR, spacing), rnd, extra));
+    // (For glyph and bar cells, z packs the water's lift into its fraction:
+    // floor(rnd * 32) + lifted.)
+    const lookRnd = select(isInk.or(inBar), floor(rnd.mul(32)).add(lifted), rnd);
+    lookBuf.element(instanceIndex).assign(vec4(surface, select(isPadNode, padR, spacing), lookRnd, extra));
   })().compute(MAX_NODES);
 
   // --------------------------------------- compute: jump-flood Voronoi grid
@@ -1417,8 +1434,20 @@ async function main() {
 
           // Glyphs: cream on water; dark when sitting on a hovered orange plate.
           const glyphCol = mix(mix(uWater, uText, extra), uDeep, fract(K1.x).div(0.9));
-          const barCol = uAccent.mul(rnd.mul(0.12).add(0.94));
+          const barCol = uAccent.mul(floor(rnd).div(32).mul(0.12).add(0.94));
           const surface = select(isGlyph, glyphCol, barCol).toVar();
+          // Riding the waves like the pads: lighter on a crest, sinking a
+          // little into the water in a trough (rnd's fraction is the lift,
+          // 0.45 = level). (Darkening toward black turned cream letters a
+          // muddy grey.)
+          const textLift = fract(rnd).sub(0.45);
+          surface.assign(
+            select(
+              textLift.greaterThan(0),
+              mix(surface, vec3(1), min(textLift.mul(1.2), 0.3)),
+              mix(surface, uWater, min(textLift.negate().mul(0.9), 0.28)),
+            ),
+          );
           sFill.assign(fill);
 
           // Lit like the lily pads and ducks: each letter's (and bar's) outer

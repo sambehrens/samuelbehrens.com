@@ -58,11 +58,14 @@ Node storage buffers (`instancedArray`, size `MAX_NODES = 2^17`):
 - `lookBuf` what the cell looks like, resolved once per node per frame:
   x surface code (0 water, 1.x pad (fraction = wave lift, 0.45 level),
   2..2.9 glyph (+hover darkening), 3 orange bar, 4.x duck body, 5.x duck bill (fraction = wave lift, like pads)),
-  y spacing (**pad radius** for pads), z rnd, w tone (glyph) / tint
+  y spacing (**pad radius** for pads), z rnd (glyph / bar cells:
+  `floor(rnd·32) + wave lift`, since their x fraction is taken), w tone
+  (glyph) / tint
 - `groupBuf` per DOM element: hover, darkens-on-hover, tones, bar ranges
 - `fieldBuf` mouse/duck wake field, 8px cells: x energy, yz flow,
   **w water height** (copied from the wave sim; nodes read it from here
-  because `nodeUpdate` is at the 8-storage-buffer limit)
+  because `nodeUpdate` is at the 8-storage-buffer limit, bilinearly via
+  `fieldHeight()` so small letter cells get smooth slopes, not 8px steps)
 
 Water buffers: `waveA`/`waveB` (ping-pong, per cell: fast h, fast h_prev,
 slow h, slow h_prev), `waveView` (vec2: both heights, written by every step),
@@ -184,6 +187,14 @@ cream, dimmed nav, hovered dark text and orange bars). Outline corners are
 rounded generously (0.55·spacing on big text) to smooth the letters' edges;
 faint seams between a letter's cells keep the Voronoi visible. All of it
 fades out on small text (`big = smoothstep(1.9, 3.6, spacing)`).
+**Letters ride the waves**: every text node (ink, halo and plate, so whole
+letters move together) is drawn offset down the water's slope
+(`TEXT_SWAY=18` px per unit slope, capped at `TEXT_SWAY_MAX=2`px; no push
+force, so they settle back as the water calms), and glyph / bar cells get
+the wave light: lighter on crests (toward white, ≤0.3), and in troughs mixed
+toward the water colour (≤0.28) as if sinking a little. A first try (sway 40,
+cap 4px, troughs darkened toward black) tore letters apart under a click
+splash and turned cream letters muddy grey.
 Tried and rejected: cracking letters into chunky pieces (a coarse procedural
 Voronoi with gaps, or grouping cells per chunk): read as broken plaster /
 scattered blobs, not as the pads' clean cells.
@@ -340,7 +351,8 @@ blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
 
 ## User preferences learned
 
-Asked for: a large ripple/wave when clicking (see Click splashes).
+Asked for: a large ripple/wave when clicking (see Click splashes); waves
+and ripples affecting the letters (see Letter styling).
 Liked: blobby rounded ripple cells, V wakes (esp. duck wakes and fast cursor
 strokes), clustered pads, Voronoi-cell pads (some bigger, a little Voronoi
 irregularity is fine; veins, lit rim), flowers, ducks parting pads, ducks drawn in the pad style, letters with the same lit
