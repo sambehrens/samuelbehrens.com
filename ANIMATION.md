@@ -10,7 +10,10 @@ shaders. This doc is for future agents picking the work up.
 
 - `index.html` — real DOM content (header, nav, links), a `<canvas id="fx">`,
   the dev menu (`.dev-menu`), and an importmap loading **three@0.186.1** from
-  jsDelivr (`three/webgpu`, `three/tsl`). No build step (GitHub Pages).
+  jsDelivr (`three/webgpu`, `three/tsl`), plus `modulepreload` links for
+  those and `three.core.js` (which three.webgpu.js imports, so it would
+  otherwise only start downloading once three.webgpu.js has arrived). No
+  build step (GitHub Pages).
 - `pond/index.html` (served at `/pond`) — the same animation with no words
   or links, so the pond fills the window, plus a small, faint fps meter in the
   bottom right (`.dev-menu.dev-mini`, a button: pale cream text on a light
@@ -639,6 +642,48 @@ pulsing push churns there; rings appear to come from under the cursor). The
 pixel shader finds the nearest centre in the 3×3 records and draws a rounded
 blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
 `waterDeep` shadow in troughs.
+
+## Startup (time to the first pond frame)
+
+The page shows plain until the first frame is drawn (`html.fx-on` is added
+then). Measured on a Retina MacBook (1440×900 @2x, headful Chrome), the
+first frame lands ~530ms after navigation with a warm cache (was ~590) and
+~590ms cold (was ~745). What startup costs:
+
+- **Modules** (~80–170ms): voronoi.js → three.webgpu.js/three.tsl.js →
+  three.core.js, now fetched in parallel via `modulepreload`.
+- **Shaders** (the big one): three turns every TSL graph into WGSL on the
+  CPU (~150ms for the compute passes, ~110ms for the full-screen quad + pad
+  pass), and the GPU process then compiles them. `nodeUpdate` (~50KB of
+  WGSL, ~2.5× the next biggest) alone takes ~240–300ms to compile and is
+  the long pole. Left to the first frame, this was all serial: ~250ms of
+  CPU in frame 0, then a ~200ms gap before frame 1.
+- **`layout()`** ~70ms the first time (~26ms after: JIT, first canvas
+  readback, reflow), and it waits for the fonts.
+
+So `main()` overlaps them: after the first `resize()` (which builds the
+pixel stage), `compileShaders()` builds each compute pass in its own task
+(`nextTask()`) and starts its pipeline with `createComputePipelineAsync`
+without waiting for it, `nodeUpdate` first, so the GPU compiles while the
+CPU builds the next pass. Meanwhile `fontsReady` resolves and `layout()`
+runs. Then the quad and pad scenes go through `renderer.compileAsync()`
+(**one after the other**: three's async builds share state, and running two
+at once made the quad build again on frame 0), and the animation loop
+starts once every pipeline is ready. Frame 0 then takes ~1ms.
+
+- This uses three internals (`renderer._pipelines.getForCompute(pass,
+  renderer._bindings.getForCompute(pass), promises)`), because
+  `compileComputeAsync()` waits for each pipeline before building the next,
+  which serializes everything (measured: slower than doing nothing). Check
+  them when upgrading three. It also skips what `renderer.compute()` does on
+  a pass's first run (`onInit`, a dispose listener), which no pass here uses.
+  A new compute pass should be added to `compileShaders()`'s list (one left
+  out still works; it just builds on frame 0).
+- Now the CPU (~340ms of building + layout) and the GPU (`nodeUpdate`)
+  finish at about the same time. Going faster needs a smaller `nodeUpdate`
+  shader or less TSL. On a first visit the Google Fonts can also arrive
+  late (~430ms seen in a fresh profile) and put `layout()` on the critical
+  path; self-hosting/preloading the fonts would help there.
 
 ## Performance notes (target: 120fps on a Retina MacBook)
 

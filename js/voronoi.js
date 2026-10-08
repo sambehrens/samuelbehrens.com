@@ -415,11 +415,13 @@ async function main() {
   // Colors are authored and blended in sRGB so the canvas matches the CSS.
   renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 
-  await Promise.all([
+  // (Only layout() needs the fonts: the shaders compile while they load.)
+  const fontsReady = Promise.all([
     document.fonts.load('400 64px "Fjalla One"'),
     document.fonts.load('700 16px "Lato"'),
-  ]).catch(() => {});
-  await document.fonts.ready;
+  ])
+    .catch(() => {})
+    .then(() => document.fonts.ready);
 
   // ---------------------------------------------------------------- uniforms
 
@@ -2439,8 +2441,37 @@ async function main() {
     pixelStage.neighbours.count = blocks;
   };
 
+  // Every shader is built before the first frame, overlapped so the pond
+  // starts sooner. Left to the first frame, three builds them all (TSL to
+  // WGSL, ~250ms of CPU) and only then hands them to the GPU process to
+  // compile (another ~200ms). Here each compute pass is built in its own
+  // task and its pipeline compiled async, so the GPU compiles one pass while
+  // the CPU builds the next, and while the fonts load and layout() runs.
+  // nodeUpdate goes first: its ~50KB shader is the long pole (~240ms to
+  // compile on its own). (three's compileComputeAsync() waits for each
+  // pipeline before building the next, which serializes it all, hence the
+  // internals. None of these passes uses onInit or is ever disposed, the
+  // two things renderer.compute() sets up on a pass's first run.)
+  const compileShaders = async () => {
+    const passes = [nodeUpdate, ...waveSteps.flat(), wavePadPass, ...duckWavePasses, facetUpdate, facetSpread, fieldUpdate];
+    const { clear, seed, padScatter, neighbours, padEdgePass, padProbe } = pixelStage;
+    passes.push(clear, seed, padScatter, ...pixelStage.passes, neighbours, padEdgePass, padProbe);
+    const compiling = [];
+    for (const pass of passes) {
+      renderer._pipelines.getForCompute(pass, renderer._bindings.getForCompute(pass), compiling);
+      await nextTask(); // (sends it to the GPU process)
+    }
+    // (One at a time: three's async builds share state.)
+    flyMesh.visible = frogMesh.visible = true;
+    await renderer.compileAsync(pixelStage.quad, pixelStage.quad.camera);
+    await renderer.compileAsync(pixelStage.pads.scene, padCamera);
+    await Promise.all(compiling);
+  };
+
   resize();
   if (tooBig) return;
+  const shadersReady = compileShaders();
+  await fontsReady;
   layout();
 
   let layoutTimer = 0;
@@ -3839,6 +3870,8 @@ async function main() {
   let gpuFrame = 0;
   const waterCursor = { x: 0, y: 0, speed: 0, fresh: true };
 
+  await shadersReady;
+  if (tooBig) return; // (a resize while compiling can still turn it off)
   renderer.setAnimationLoop(() => {
     const now = performance.now();
     const dt = Math.min((now - last) / 1000, 1 / 30);
@@ -3954,6 +3987,11 @@ async function main() {
       root.classList.add("fx-on");
     }
   });
+}
+
+// Resolves in a later task (so WebGPU calls made so far reach the GPU process).
+function nextTask() {
+  return globalThis.scheduler?.yield ? scheduler.yield() : new Promise((resolve) => setTimeout(resolve));
 }
 
 // One rect per non-space character, in document coordinates.

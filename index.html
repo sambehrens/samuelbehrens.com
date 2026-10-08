@@ -36,6 +36,10 @@
         }
       }
     </script>
+    <!-- (three.webgpu.js imports three.core.js: fetch all three at once) -->
+    <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.webgpu.js" crossorigin />
+    <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.tsl.js" crossorigin />
+    <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.core.js" crossorigin />
     <script type="module" src="js/voronoi.js"></script>
   </head>
   <body>
