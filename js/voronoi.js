@@ -135,8 +135,8 @@ const DUCKS_IDLE = 2.5;
 const MAX_DUCKLINGS = 64;
 // Raccoons swim through now and then (only while there are ducklings to
 // hunt): they stalk the nearest duckling, crouch, lunge, and swallow it
-// whole, getting a little rounder for each; full after RACCOON_FULL they
-// paddle off. Ducklings flee them and ducks steer clear. Their slots sit
+// whole, its belly filling out (and it slowing down) with each, quickly at
+// first and less and less after (there's no "full": it just gets harder). Ducklings flee them and ducks steer clear. Their slots sit
 // between the big ducks' and the ducklings'.
 const MAX_RACCOONS = 2;
 const FIRST_COON = MAX_DUCKS;
@@ -150,8 +150,12 @@ const RACCOON_NOTICE = 230; // css px: it goes after a duckling this close
 const RACCOON_POUNCE = 80; // css px from mouth to duckling when it crouches to lunge
 const RACCOON_LUNGE = 6; // lunge speed (x DUCK_SPEED)
 const RACCOON_CATCH = 19; // css px from its mouth: caught
-const RACCOON_FULL = 3; // ducklings until it's full and leaves
-const RACCOON_GROW = 0.07; // how much rounder it gets per duckling
+// Its belly (x its radius) after n meals (ducklings or frogs): 1 +
+// RACCOON_GROW * ln(1 + n), so 1.22 after one, 1.44 after three, 1.77 after
+// ten: growing fast at first, then less and less, with no limit.
+const RACCOON_GROW = 0.32;
+const RACCOON_STAY = [150, 240]; // s it stays in the pond (turning back from the edges) before it heads off
+const RACCOON_HEAVY = 0.6; // the fuller, the slower: its speeds are divided by belly^this (89% after one meal, 80% after three, 71% after ten: it can always still hunt, just less well)
 const RACCOON_PADDLE = 7;
 // Dragonflies dart about over the pond (quick straight darts, dead stops to
 // hover and pivot), now and then settle on a lily pad, sit a while with
@@ -266,6 +270,12 @@ const coonCells = (() => {
 })();
 const COON_MOUTH = 20 * RACCOON_SCALE; // css px ahead of its centre
 const COON_TAIL = -12 * RACCOON_SCALE; // where its tail starts to wag
+const COON_BELLY = 8.8 * RACCOON_SCALE; // radius of its round back (belly) cell, css px
+// Only its belly grows as it eats (x belly); its head moves forward and its
+// tail back by this much to make room, so they keep their size. (~1.1x
+// the belly's growth keeps the power bisectors to head and tail where they
+// were, relative to them.)
+const coonShift = (belly) => (belly - 1) * COON_BELLY * 1.1;
 const isChickSlot = (i) => i >= FIRST_CHICK;
 const isCoonSlot = (i) => i >= FIRST_COON && i < FIRST_CHICK;
 const slotCells = (i) => (isChickSlot(i) ? chickCells : isCoonSlot(i) ? coonCells : duckCells);
@@ -434,7 +444,7 @@ async function main() {
   const duckData = Array.from({ length: DUCK_SLOTS }, () => new THREE.Vector4(-1e5, -1e5, 1, 0));
   const uDucks = uniformArray(duckData, "vec4");
   const duckVel = Array.from({ length: DUCK_SLOTS }, () => new THREE.Vector4());
-  const uDuckVel = uniformArray(duckVel, "vec4"); // xy velocity, z body bend, w size (1 = normal)
+  const uDuckVel = uniformArray(duckVel, "vec4"); // xy velocity, z body bend, w size (1 = normal; a raccoon's: how full its belly is)
   // The slots of the ducks in the water, packed (x slot, y kind: 0 duck, 1
   // duckling, 2 raccoon): the shaders loop over just these, so a big pool of
   // slots costs nothing until ducks fill it.
@@ -910,10 +920,15 @@ async function main() {
     const isBg = Hm.w.lessThan(0.5);
     const isDuck = Hm.w.greaterThan(3.5).and(Hm.w.lessThan(4.5));
     // (A duck cell's slot, and that slot's size: a duckling being swallowed
-    // shrinks away, a raccoon gets rounder with each one.)
+    // shrinks away. A raccoon's is how full its belly is: only its belly
+    // cell grows, and its head and tail move out to make room.)
     const duckIdx = max(int(A.x), int(0));
-    const slotSize = select(isDuck, uDuckVel.element(duckIdx).w, float(1));
-    const spacing = A.y.mul(max(slotSize, 0.02)); // (never 0: some maths below divides by it)
+    const duckW = select(isDuck, uDuckVel.element(duckIdx).w, float(1));
+    const coonCell = isDuck.and(duckIdx.greaterThanEqual(FIRST_COON)).and(duckIdx.lessThan(FIRST_CHICK));
+    const slotSize = select(coonCell, float(1), duckW);
+    const belly = select(coonCell, duckW, float(1));
+    const isBelly = coonCell.and(abs(A.w.sub(PART_FUR)).lessThan(0.5));
+    const spacing = A.y.mul(max(slotSize, 0.02)).mul(select(isBelly, belly, float(1))); // (never 0: some maths below divides by it)
     const rnd = A.z;
 
     // Intro: nodes start scattered and lock on in a staggered wave.
@@ -1000,7 +1015,8 @@ async function main() {
     // A raccoon's tail floats out behind and wags in a slow wave that runs
     // down it, swinging more toward the tip.
     const wag = sin(uTime.mul(2.3).add(A.x.mul(1.7)).add(Hm.x.mul(0.05))).mul(Hm.x.negate().add(COON_TAIL).mul(0.11));
-    const straight = Hm.xy.add(vec2(0, select(onHead, bob, select(onTail, wag, float(0))))).mul(slotSize);
+    const shift = belly.sub(1).mul(COON_BELLY * 1.1); // (see coonShift)
+    const straight = Hm.xy.add(vec2(select(onHead, shift, select(onTail, shift.negate(), float(0))), select(onHead, bob, select(onTail, wag, float(0))))).mul(slotSize);
     // Bend the body along its turn: rotating each cell by an angle
     // proportional to how far forward it is curls head and tail into an arc.
     const bend = straight.x.mul(uDuckVel.element(duckIdx).z);
@@ -1039,10 +1055,14 @@ async function main() {
     const gulped = isDuck.and(slotSize.lessThan(0.98));
     forEachDuck(({ slot, size, pick }) => {
       // (Tail to bill tip and side to side, plus a margin.)
-      // (Sizes kept above 0: a NaN here would poison every node for good.)
-      const sz = max(size, 0.05);
-      const rx = padReach.add(pick(...ext.map((e) => e.half + 4)).mul(sz));
-      const ry = padReach.add(pick(...ext.map((e) => e.ry + 4)).mul(sz));
+      // (Sizes kept above 0: a NaN here would poison every node for good.
+      // A raccoon's isn't a scale: its belly is wider and it's longer by
+      // its head and tail moving out.)
+      const coon = pick(0, 0, 1);
+      const sz = mix(max(size, 0.05), float(1), coon);
+      const longer = coon.mul(size.sub(1).mul(COON_BELLY * 1.1));
+      const rx = padReach.add(pick(...ext.map((e) => e.half + 4)).mul(sz)).add(longer);
+      const ry = padReach.add(max(pick(...ext.map((e) => e.ry + 4)).mul(sz), coon.mul(size.mul(COON_BELLY).add(4))));
       const other = uDucks.element(slot);
       const away = p.sub(uScroll).sub(other.xy.add(other.zw.mul(pick(...ext.map((e) => e.mid)).mul(sz))));
       const side = vec2(other.w.negate(), other.z);
@@ -2480,6 +2500,7 @@ async function main() {
     coon: isCoonSlot(i),
     leader: -1,
     size: 1,
+    belly: 1,
   }));
   // (The first duck comes soon and the second not long after.)
   let nextDuck = 1.5 + Math.random() * 3;
@@ -2497,6 +2518,11 @@ async function main() {
     const vx = d.x - scrollX;
     const vy = d.y - scrollY;
     return vx < -m || vy < -m || vx > innerWidth + m || vy > innerHeight + m;
+  };
+  // Where a raccoon's mouth is (its head moves forward as its belly fills).
+  const coonMouth = (r) => {
+    const m = COON_MOUTH + coonShift(r.belly);
+    return { x: r.x + Math.cos(r.heading) * m, y: r.y + Math.sin(r.heading) * m };
   };
   // A duck in a line: a big duck, or a duckling whose leaders lead to one.
   const motherOf = (i) => {
@@ -2689,10 +2715,11 @@ async function main() {
     if (c.eaten > 0) {
       // Caught: drawn into the raccoon's mouth, shrinking away to nothing.
       const R = ducks[c.by];
+      const M = coonMouth(R);
       c.eaten += dt;
       const k = 1 - Math.exp(-dt * 18);
-      c.x += (R.x + Math.cos(R.heading) * COON_MOUTH * R.size - c.x) * k;
-      c.y += (R.y + Math.sin(R.heading) * COON_MOUTH * R.size - c.y) * k;
+      c.x += (M.x - c.x) * k;
+      c.y += (M.y - c.y) * k;
       c.vx = R.vx;
       c.vy = R.vy;
       c.bend = 0;
@@ -2807,10 +2834,12 @@ async function main() {
         const hy = Math.sin(o.heading);
         // (Nearest point on its spine, from its middle back to near the
         // tail tip.)
-        const along = Math.max(-(extents[j].back - extents[j].ry) * o.size, Math.min(0, (c.x - o.x) * hx + (c.y - o.y) * hy));
+        // (A full belly makes it longer and wider.)
+        const wide = Math.max(extents[j].ry, COON_BELLY * o.belly);
+        const along = Math.max(-(extents[j].back + coonShift(o.belly) - wide), Math.min(0, (c.x - o.x) * hx + (c.y - o.y) * hy));
         ox = o.x + hx * along;
         oy = o.y + hy * along;
-        minD = extents[i].ry + extents[j].ry * o.size + 2;
+        minD = extents[i].ry + wide + 2;
       }
       const ax = c.x - ox;
       const ay = c.y - oy;
@@ -2851,9 +2880,12 @@ async function main() {
   //   lunge: a quick burst at it, homing a little; any duckling within
   //     RACCOON_CATCH of its mouth is caught, else it overshoots
   //   recover: coasts, shakes it off, then stalks again (or gives up)
-  //   munch: stops and wriggles happily while the duckling shrinks into its
-  //     mouth with a little splash, and fills out a bit (RACCOON_GROW); then
-  //     a rest before hunting again, or, full, it leaves.
+  //   munch: stops and wriggles happily while the duckling (or frog)
+  //     shrinks into its mouth with a little splash, and its belly fills out
+  //     (RACCOON_GROW; only the belly: head and tail move out to make room,
+  //     and it gets a little slower, RACCOON_HEAVY); then a rest before
+  //     hunting again. Until its stay is up (RACCOON_STAY) it turns back
+  //     from the edges of the view; then it heads for the nearest edge.
   // A hard push from the waves spooks it off the hunt for a while, so people
   // can save ducklings.
   const coonTest = params.has("raccoontest");
@@ -2881,12 +2913,14 @@ async function main() {
       prey: null, // (a duckling or a frog)
       hunt: 0, // s spent on this hunt
       meals: 0,
-      size: 1,
+      belly: 1, // how full (its belly cell's size)
+      stay: between(...RACCOON_STAY), // s before it heads off (there's no "full")
     });
     if (coonTest && i === FIRST_COON) {
       // ?raccoontest=x,y,heading (fractions of the view, radians) to aim it.
-      const [fx = 0.25, fy = 0.5, fh = 0] = (params.get("raccoontest") || "").split(",").filter(Boolean).map(Number);
-      Object.assign(r, { x: scrollX + innerWidth * fx, y: scrollY + innerHeight * fy, base: fh, heading: fh, age: 3, rest: 0.5 });
+      // (A 4th value: meals it has already had.)
+      const [fx = 0.25, fy = 0.5, fh = 0, meals = 0] = (params.get("raccoontest") || "").split(",").filter(Boolean).map(Number);
+      Object.assign(r, { x: scrollX + innerWidth * fx, y: scrollY + innerHeight * fy, base: fh, heading: fh, age: 3, rest: 0.5, meals, belly: 1 + RACCOON_GROW * Math.log1p(meals) });
     }
   };
   // What a raccoon can catch: ducklings, and frogs out in the open (not
@@ -2908,8 +2942,7 @@ async function main() {
       r.rest = Math.max(r.rest, 4);
       r.base += angleTo(Math.atan2(r.dy, r.dx), r.base) * (1 - Math.exp(-dt * 2));
     }
-    const mx = r.x + Math.cos(r.heading) * COON_MOUTH * r.size;
-    const my = r.y + Math.sin(r.heading) * COON_MOUTH * r.size;
+    const { x: mx, y: my } = coonMouth(r);
     const P = r.prey;
     const preyOk = P && P.active && !P.eaten && (!P.frog || frogExposed(P));
     const preyDist = preyOk ? Math.hypot(P.x - mx, P.y - my) : Infinity;
@@ -2917,7 +2950,27 @@ async function main() {
     let turn = 1.5; // how fast it turns to its heading (1/s)
     let sniff = 1; // how much it weaves
     if (r.mode === "cruise") {
-      if (r.rest <= 0 && r.meals < RACCOON_FULL) {
+      if (r.age > r.stay) {
+        // Had its time here: off to the nearest edge.
+        const vx = r.x - scrollX;
+        const vy = r.y - scrollY;
+        const ways = [
+          [vx, Math.PI],
+          [innerWidth - vx, 0],
+          [vy, -Math.PI / 2],
+          [innerHeight - vy, Math.PI / 2],
+        ].sort((a, b) => a[0] - b[0]);
+        r.base = ways[0][1];
+        set("leave");
+      } else if (r.age > 6 && offScreen(r, -70)) {
+        // (Not done here yet: nearing the edge of the view, it turns back
+        // into the pond, toward somewhere in the middle of it.)
+        const tx = scrollX + innerWidth * between(0.25, 0.75);
+        const ty = scrollY + innerHeight * between(0.25, 0.75);
+        const back = Math.atan2(ty - r.y, tx - r.x);
+        if (Math.abs(angleTo(back, r.base)) > Math.PI / 2) r.base = back;
+      }
+      if (r.mode === "cruise" && r.rest <= 0) {
         let best = null;
         let bd = RACCOON_NOTICE;
         for (const c of preyAround()) {
@@ -2963,7 +3016,7 @@ async function main() {
       sniff = 0;
       if (preyOk) r.base = Math.atan2(P.y - my, P.x - mx);
       let caught = null;
-      let cd = RACCOON_CATCH * r.size;
+      let cd = RACCOON_CATCH;
       for (const c of preyAround()) {
         const dd = Math.hypot(c.x - mx, c.y - my);
         if (dd < cd) {
@@ -2996,27 +3049,19 @@ async function main() {
       sniff = 0;
       if (r.modeT > 1.4) {
         r.rest = between(5, 9);
-        if (r.meals < RACCOON_FULL) set("cruise");
-        else {
-          // Full: off to the nearest edge.
-          const vx = r.x - scrollX;
-          const vy = r.y - scrollY;
-          const ways = [
-            [vx, Math.PI],
-            [innerWidth - vx, 0],
-            [vy, -Math.PI / 2],
-            [innerHeight - vy, Math.PI / 2],
-          ].sort((a, b) => a[0] - b[0]);
-          r.base = ways[0][1];
-          set("leave");
-        }
+        set("cruise");
       }
     } else if (r.mode === "leave") {
       speed = 0.85;
     }
     // (Happy wriggle while munching.)
     r.wiggle = r.mode === "munch" ? 0.012 * Math.sin(r.modeT * 16) * Math.max(0, 1 - r.modeT / 1.4) : 0;
-    r.size += (1 + RACCOON_GROW * r.meals - r.size) * (1 - Math.exp(-dt * 1.2));
+    // Its belly fills out after each meal, and the fuller it is the slower
+    // it swims, stalks and lunges (and, a little, the more slowly it turns).
+    r.belly += (1 + RACCOON_GROW * Math.log1p(r.meals) - r.belly) * (1 - Math.exp(-dt * 1.2));
+    const heavy = r.belly ** -RACCOON_HEAVY;
+    speed *= heavy;
+    turn *= Math.sqrt(heavy);
     const sway = sniff * (0.45 * Math.sin(t * 0.5 + r.phase) + 0.2 * Math.sin(t * 1.3 + r.phase * 1.7));
     const before = r.heading;
     r.heading += angleTo(r.base + sway, r.heading) * (1 - Math.exp(-dt * turn));
@@ -3071,7 +3116,7 @@ async function main() {
       if (d.active) {
         // (The shaders take ducks in viewport coordinates.)
         duckData[i].set(d.x - scrollX, d.y - scrollY, Math.cos(d.heading), Math.sin(d.heading));
-        duckVel[i].set(d.vx, d.vy, d.bend + (d.wiggle || 0), d.size);
+        duckVel[i].set(d.vx, d.vy, d.bend + (d.wiggle || 0), d.coon ? d.belly : d.size);
         // (A swallowed duckling nearly gone no longer pushes anything.)
         if (d.size > 0.02) duckList[n++].set(i, d.chick ? 1 : d.coon ? 2 : 0, 0, 0);
       } else {
@@ -3083,7 +3128,7 @@ async function main() {
     if (duckTest || coonTest) {
       const d = ducks[0];
       window.__duck = { x: d.x - scrollX, y: d.y - scrollY, h: d.heading, dx: d.dx, dy: d.dy };
-      window.__ducks = ducks.map((c) => c.active && { x: c.x - scrollX, y: c.y - scrollY, leader: c.leader, chick: c.chick, coon: c.coon, mode: c.mode, size: c.size, eaten: c.eaten, meals: c.meals, prey: c.prey ? (c.prey.frog ? "frog" : "duckling") : null });
+      window.__ducks = ducks.map((c) => c.active && { x: c.x - scrollX, y: c.y - scrollY, leader: c.leader, chick: c.chick, coon: c.coon, mode: c.mode, size: c.size, belly: c.belly, eaten: c.eaten, meals: c.meals, prey: c.prey ? (c.prey.frog ? "frog" : "duckling") : null });
     }
   };
 
@@ -3582,8 +3627,7 @@ async function main() {
     const r = ducks.find((o) => o.active && o.coon && o.prey === f);
     if (!r) return null;
     // (How near its mouth is.)
-    const mx = r.x + Math.cos(r.heading) * COON_MOUTH * r.size;
-    const my = r.y + Math.sin(r.heading) * COON_MOUTH * r.size;
+    const { x: mx, y: my } = coonMouth(r);
     const near = Math.max(0, 1 - Math.hypot(f.x - mx, f.y - my) / RACCOON_NOTICE);
     const rate = r.mode === "lunge" ? FROG_NOTICE.lunge : r.mode === "crouch" ? FROG_NOTICE.crouch : r.mode === "stalk" ? FROG_NOTICE.stalk * near : 0;
     return { away: Math.atan2(f.y - r.y, f.x - r.x), chance: rate * dt };
@@ -3615,11 +3659,11 @@ async function main() {
     let probe = null; // (a viewport point to ask about)
     if (f.eaten > 0) {
       // Caught: drawn into the raccoon's mouth, shrinking away to nothing.
-      const R = ducks[f.by];
+      const M = coonMouth(ducks[f.by]);
       f.eaten += dt;
       const k = 1 - Math.exp(-dt * 18);
-      f.x += (R.x + Math.cos(R.heading) * COON_MOUTH * R.size - f.x) * k;
-      f.y += (R.y + Math.sin(R.heading) * COON_MOUTH * R.size - f.y) * k;
+      f.x += (M.x - f.x) * k;
+      f.y += (M.y - f.y) * k;
       f.size = 0.97 * Math.max(0, 1 - (f.eaten / 0.45) ** 2);
       if (f.eaten > 0.5) f.active = false;
       probeAsk[i].set(-1e5, -1e5, -1, 0);

@@ -35,7 +35,9 @@ also puts the duck's viewport position in `window.__duck` and every duck
 slot's position / leader in `window.__ducks`; e.g.
 `?seed=0&ducktest=0.5,0.38,0` sends it through a pad colony), `?raccoontest`
 sends a raccoon in at 25%/50% heading right after 1.5s
-(`?raccoontest=x,y,heading`; `?ducktest&raccoontest=0.42,0.5,0` starts it
+(`?raccoontest=x,y,heading,meals`, meals already eaten, for its belly;
+use a heading like 0.001, since 0 is dropped as empty;
+`?ducktest&raccoontest=0.42,0.5,0` starts it
 just behind the test duck's brood, which makes a hunt within seconds; each
 `__ducks` entry then also has coon, mode, size, eaten, meals), `?flytest`
 sends a dragonfly in after 0.5s that keeps looking for pads (each perch's
@@ -98,8 +100,13 @@ Uniform arrays (one entry per **duck slot**: `MAX_DUCKS` big ducks, then
 `MAX_RACCOONS` raccoons (from `FIRST_COON`), then `MAX_DUCKLINGS` ducklings
 (from `FIRST_CHICK`)): `uDucks` (viewport pos + heading), `uDuckVel` (vel +
 body bend in z + **size** in w: 1 normal, a swallowed duckling shrinks to 0,
-a raccoon grows as it eats; it scales the slot's cell radii, cell offsets,
-shove ellipse, paddling and wake); `uDuckList` + `uDuckCount` (the slots of
+and it scales the slot's cell radii, cell offsets, shove ellipse, paddling
+and wake. For a **raccoon** it's instead how full its belly is (≥1): only
+its belly cell (`PART_FUR` with no head/tail mark) grows by it, its head
+cells move forward and tail cells back by `coonShift` = 1.1 × the belly's
+growth (keeps the power bisectors to head and tail where they were, so they
+keep their size), and its shove ellipse gets longer by that and wider to
+the belly); `uDuckList` + `uDuckCount` (the slots of
 the ducks in the water, packed: x slot, y kind 0 duck / 1 duckling / 2
 raccoon); `uDrops` (click splashes: document pos, start time, strength).
 
@@ -416,9 +423,23 @@ Modes:
   `munch`; else → `recover` (0.9s coast), then stalks again.
 - `munch`: stops and wriggles (body bend `wiggle`) for 1.4s while the
   duckling (`eaten` timer, `by`) is drawn into its mouth and shrinks to
-  nothing in 0.45s, with a small splash (`splash(…, 0.15)`); the raccoon
-  fills out by `RACCOON_GROW=0.07` per duckling. Then a 5–9s rest; after
-  `RACCOON_FULL=3` it heads for the nearest edge (`leave`).
+  nothing in 0.45s, with a small splash (`splash(…, 0.15)`); its **belly**
+  fills out (only the belly; head and tail stay the same size). Then a 5–9s
+  rest. There's no "full". It **stays** `RACCOON_STAY` 150–240s (owner
+  wanted them to stay longer): until then, cruising within 70px of the
+  view's edge and heading out, it turns back toward somewhere in the middle
+  of the view (tested: in view 99% of two minutes); then it heads for the
+  nearest edge (`leave`).
+**Belly and weight** (owner asked that raccoons get bigger the more they
+eat, only the stomach blob, and slower the bigger, never so slow it can't
+hunt, with no limit but growing less and less): belly =
+`1 + RACCOON_GROW·ln(1 + meals)` (`RACCOON_GROW=0.32`: 1.22 after one meal,
+1.44 after three, 1.77 after ten); its speeds (cruise, stalk, lunge) are
+divided by `belly^RACCOON_HEAVY` (0.6: 89% / 80% / 71%), turning by the
+square root of that. Tested (`?ducktest&raccoontest=0.42,0.5,0.001,M`):
+empty, a catch in 8–12s after 2 lunges; 3 meals, 17–23s after 4–7 lunges;
+10 meals, 2 of 3 runs caught one within 30s. (A first try slowing it by
+`belly^1.2` with linear growth, full after 4, was too slow too soon.)
 A hard wave push (drift > 28px/s) spooks it off the hunt for 4s and turns it
 with the water, so people can save ducklings. Waves push it less than a
 duck (0.6× gain). Two raccoons keep apart.
@@ -433,7 +454,7 @@ turn away (not just aside) and hurry (`startle`), leading their broods off.
 `motherOf` never counts a raccoon (or a swallowed duckling) as a line.
 
 **Spawning:** first after 25–45s, then every `RACCOON_EVERY` 50–100s, but
-only while a duckling is in view (else it checks every 3s). Tested: with
+only while a duckling or a frog on a pad is in view (else it checks every 3s). Tested: with
 `?ducktest&raccoontest=0.42,0.5,0` every run ended in a catch after 1–3
 lunges with near misses (stalk 1.05× never got close; without the sneaky
 stalk every lunge missed); naturally, the first raccoon arrived at 34s,
@@ -681,7 +702,8 @@ and ripples affecting the letters (see Letter styling); ducklings in a line
 behind about half the ducks, separable, swimming back to the nearest duck
 (see Ducklings); more ducks / ducklings that feel unlimited with
 interaction (see Ducks); cute raccoons that hunt and swallow ducklings and
-that ducks avoid (see Raccoons); dragonflies that land on pads with very
+that ducks avoid, their bellies filling out (slower, never stopped) the
+more they eat (see Raccoons); dragonflies that land on pads with very
 gentle ripples, curved natural flight, simple style (see Dragonflies);
 frogs that leap between the water and pads with proportional ripples, flee
 when disturbed, can be eaten, no eyes (see Frogs).
