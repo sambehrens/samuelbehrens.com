@@ -11,6 +11,11 @@ shaders. This doc is for future agents picking the work up.
 - `index.html` — real DOM content (header, nav, links), a `<canvas id="fx">`,
   the dev menu (`.dev-menu`), and an importmap loading **three@0.186.1** from
   jsDelivr (`three/webgpu`, `three/tsl`). No build step (GitHub Pages).
+- `pond/index.html` (served at `/pond`) — the same animation with no words,
+  links or dev menu: just the canvas, so the pond fills the window. It loads
+  `../css/home.css` and `../js/voronoi.js` unchanged; with no `[data-fx]`
+  elements `layout()` only places water and pads, and `setupDevMenu()` returns
+  early when the page has no `.dev-menu`. Same URL params work there.
 - `css/home.css` — page styles. When the effect runs, `html.fx-on` makes DOM
   text transparent (it stays for layout, links, selection, a11y) and hides the
   CSS underline bars. `html.fx-debug` shows DOM text in red for alignment.
@@ -25,7 +30,7 @@ duck (always with a brood of ducklings) immediately at 70%/45% of the viewport h
 (`?ducktest=x,y,heading` to aim it, fractions of the view / radians; it
 also puts the duck's viewport position in `window.__duck` and every duck
 slot's position / leader in `window.__ducks`; e.g.
-`?ducktest=0.5,0.38,0` sends it through a pad colony), `?raccoontest`
+`?seed=0&ducktest=0.5,0.38,0` sends it through a pad colony), `?raccoontest`
 sends a raccoon in at 25%/50% heading right after 1.5s
 (`?raccoontest=x,y,heading`; `?ducktest&raccoontest=0.42,0.5,0` starts it
 just behind the test duck's brood, which makes a hunt within seconds; each
@@ -34,7 +39,8 @@ sends a dragonfly in after 0.5s that keeps looking for pads (each perch's
 state in `window.__flies`, incl. why it last took off; `window.__splash(x,
 y, strength)` makes a splash at a viewport point), `?gputime` turns
 on GPU timestamp queries and puts `{c, r}` (compute / render ms, every 30
-frames) in `window.__gpu` (splits compute into three submissions). The
+frames) in `window.__gpu` (splits compute into three submissions), `?seed=N`
+repeats one pond layout (see Lily pads; random per visit otherwise). The
 bottom-right dev menu (`setupDevMenu()`) has an fps meter, debug toggle,
 effects on/off link.
 
@@ -157,6 +163,13 @@ reverses the winding (it was invisibly back-face culled).
 
 - Pads grow in colonies: `padField = noise(home/230) + jitter > PAD_CLUSTER`
   (0.12) (computed in `nodeUpdate`; `isPadNode`).
+- **Every visit gets a different pond**: `POND_SEED` (random per page load,
+  or `?seed=N` to repeat one) picks the colony noise's slice
+  (`PAD_NOISE_Z = 3.7 + seed·1.618`, shared by `padField`, `patchPad` and
+  `wavePadPass`), salts the merged-patch hash and seeds `layout()`'s RNG
+  (`mulberry32(1337 + seed)`). It stays fixed for the visit, so resizes keep
+  the same pond. `?seed=0` is the pond every visit used to get (owner asked
+  why the pads were always arranged the same way).
 - **A pad is a weighted node**: power weight `padR²`. Against unweighted
   nodes (water, ducks, text) every bisector is ≥ padR away, so the whole disc
   of radius padR is its own: round leaves in open water. Between two pads the
@@ -222,7 +235,7 @@ scattered blobs, not as the pads' clean cells.
 Palettes in `PALETTES.light/dark` (water, pads, petals, ripple, text=cream,
 accent=#ffb82b used for underlines, duck bill, flower centres; duckling
 yellow; raccoon grey `raccoon`, `raccoonDark` and `raccoonPale`; dragonfly
-orange-red `fly`, `flyDark`, clear `flyWing`). Colours are
+orange-red `fly`, clear `flyWing`). Colours are
 sRGB values (`outputColorSpace = LinearSRGBColorSpace`, no conversion).
 
 ## Text
@@ -419,17 +432,27 @@ off when their pad is disturbed; then for a very gentle ripple, a more
 natural path than straight lines, and a simpler design.
 
 **Look** (`flyMesh`, drawn in the lily pad pass's scene after the pads,
-over everything): as simple and cute as the ducks, two chubby blobs in
-flat colour with the cells' lit rim (top left) and thin darker edge (a big
-round head, a short teardrop body) and four round clear petal wings spread
-in an X (SDFs in the fragment shader, one quad per slot, in units of
-`FLY_SIZE=1.3`px). Flying, the wings beat (foreshorten and fade, fore and
+over everything): as simple and cute as the ducks. The body is one chubby
+rounded pill in flat colour with the cells' lit rim (top left) and thin
+darker edge: an exact uneven capsule, head end r=2.9 at x=5.5 tapering
+slightly to r=2.2 14 units behind. It's widest where the wings meet it.
+Four round clear wings spread out **sideways** (fore pair angled a little
+forward, L 7.2 × W 3.4 from x=1.6; hind a little back, 6.8 × 3.6 from
+x=−0.6) give the classic dragonfly cross silhouette (SDFs in the fragment
+shader, one quad per slot, in units of `FLY_SIZE=1.3`px). Owner asked for
+one body shape, not a separate head and body, and said a round head
+blended into a tail "looks like a matchstick": a fat end on a thin tail
+reads as a knob on a stick however it's blended (teardrops, eggs and
+cones were all tried), so the fix was an even body plus sideways wings. Flying, the wings beat (foreshorten and fade, fore and
 hind out of step, 26Hz); perched, they lie flat. A soft shadow down-right,
 further and softer the higher it flies (`FLY_ALT=24`px); a little bigger
 when high. Perched, the vertex stage places it at its pad's live `siteBuf`
 position plus its spot, so it rides the pad's sway exactly. (Too detailed,
 and rejected: a first take with segment bands, wing veins, tip spots and
-eye glints; then two eye beads, a thorax and a long thin abdomen. Designed
+eye glints; then two eye beads, a thorax and a long thin abdomen; then a
+darker round head on a separate teardrop body with petal wings in an X;
+then that head and body blended into one teardrop (the matchstick).
+Designed
 in a 2D SDF prototype. Its own render pass cost ~2ms of GPU at Retina size:
 hence drawn in the pad pass.)
 
@@ -451,8 +474,12 @@ draws in, wings slow) with a tiny-drop ripple round the rim, and sits
 `FLY_PERCH` 4–14s. **Disturbed:** after 1.2s (its own ripple settles), it
 measures the watched pad: moving faster than `FLY_SPOOK=16`px/s or drifting
 `FLY_SHIFT=5`px from where it settled (that rest point creeps with the pads'
-slow wander), or no longer a pad, sends it off (a farther dart) with
-another ripple. A relayout (`layoutGen`) changes node ids, so it lets go.
+slow wander), or no longer a pad, sends it off with another ripple, and
+it **bolts** (owner asked for a quicker escape when a ripple disturbs it):
+a 0.1s lift instead of 0.3s, then a dart of 180–320px at 650–800px/s that
+starts at full speed and only slows toward the end (ease-out, stiffer
+spring, top speed 1000px/s), ~200px from the pad 0.4s after leaving; a
+calm take-off eases into a 300–420px/s dart. A relayout (`layoutGen`) changes node ids, so it lets go.
 Tested: a click 120px away sends it off ~0.55s later (as the ring reaches
 it); one 300px away doesn't; left alone it sits its full time. After 1–3
 pads (or 75s) it sweeps off out of view. Spawning: first after 5–10s, then

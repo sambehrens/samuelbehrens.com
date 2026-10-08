@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>Pond · Sam Behrens</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="The pond from the homepage of samuelbehrens.com, without the words." />
+    <meta name="author" content="Sam Behrens" />
+    <meta name="color-scheme" content="light dark" />
+
+    <link rel="stylesheet" href="../css/home.css" />
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.webgpu.js",
+          "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.tsl.js"
+        }
+      }
+    </script>
+    <script type="module" src="../js/voronoi.js"></script>
+  </head>
+  <body>
+    <!-- The homepage's pond on its own: no words or links (no [data-fx]
+         elements), so the water, lily pads and animals fill the window. -->
+    <canvas id="fx" aria-hidden="true"></canvas>
+  </body>
+</html>

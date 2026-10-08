@@ -288,7 +288,6 @@ const PALETTES = {
     raccoonDark: "#45413d",
     raccoonPale: "#efe9de",
     fly: "#ec5b2c",
-    flyDark: "#7a2414",
     flyWing: "#f1f7ff",
   },
   dark: {
@@ -310,7 +309,6 @@ const PALETTES = {
     raccoonDark: "#302d2b",
     raccoonPale: "#ddd6c9",
     fly: "#d9552d",
-    flyDark: "#5c1d10",
     flyWing: "#d6e4f0",
   },
 };
@@ -320,6 +318,13 @@ const params = new URLSearchParams(location.search);
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
 const darkScheme = matchMedia("(prefers-color-scheme: dark)");
 const narrow = matchMedia("(max-width: 600px)");
+// Each visit gets its own pond: this picks where the lily pad colonies grow,
+// which patches merge into big pads and every node's jitter. Fixed for the
+// whole visit, so a resize keeps the same pond. (?seed=N to repeat one; 0 is
+// the pond every visit used to get.)
+const POND_SEED = params.has("seed") ? (parseInt(params.get("seed"), 10) >>> 0) % 100000 : Math.floor(Math.random() * 100000);
+// (The colony noise is read on its own slice per seed.)
+const PAD_NOISE_Z = 3.7 + POND_SEED * 1.618;
 
 setupDevMenu();
 
@@ -488,7 +493,6 @@ async function main() {
     raccoonDark: uRaccoonDark,
     raccoonPale: uRaccoonPale,
     fly: uFly,
-    flyDark: uFlyDark,
     flyWing: uFlyWing,
   } = palette;
 
@@ -573,7 +577,7 @@ async function main() {
   const wavePadPass = Fn(() => {
     const idx = int(instanceIndex);
     const c = uWaveOrigin.add(vec2(float(idx.mod(uWW)), float(idx.div(uWW))).add(0.5).mul(WAVE_CELL));
-    wavePads.element(idx).assign(smoothstep(PAD_CLUSTER - 0.04, PAD_CLUSTER + 0.16, mx_noise_float(vec3(c.mul(1 / 230), 3.7))).mul(0.8));
+    wavePads.element(idx).assign(smoothstep(PAD_CLUSTER - 0.04, PAD_CLUSTER + 0.16, mx_noise_float(vec3(c.mul(1 / 230), PAD_NOISE_Z))).mul(0.8));
   })().compute(waveCap);
   const WAVE_K = WAVE_FREQ.map((f, i) => (Math.PI * 2 * f) / WAVE_SPEED[i]);
 
@@ -881,18 +885,18 @@ async function main() {
 
     // Lily pads grow in colonies: a slow noise field over the pond (by base
     // home, so it never moves), with a little randomness at cluster edges.
-    const padField = mx_noise_float(vec3(Hm.xy.mul(1 / 230), 3.7)).add(rnd.sub(0.5).mul(0.25));
+    const padField = mx_noise_float(vec3(Hm.xy.mul(1 / 230), PAD_NOISE_Z)).add(rnd.sub(0.5).mul(0.25));
     // Some patches of 2x2 background-grid cells merge their small pads into
     // one big one: the patch's chosen node becomes a big pad and the rest
     // stay water.
     const quad = floor(Hm.xy.add(spacing).div(spacing));
     const patch = floor(quad.div(2));
-    const patchSeed = uint(int(patch.x).add(4096)).mul(uint(7919)).add(uint(int(patch.y).add(4096)).mul(uint(104729)));
+    const patchSeed = uint(int(patch.x).add(4096)).mul(uint(7919)).add(uint(int(patch.y).add(4096)).mul(uint(104729))).add(uint(POND_SEED * 31337));
     const merged = hash(patchSeed).lessThan(MERGE_FRACTION);
     const quadIdx = quad.x.sub(patch.x.mul(2)).add(quad.y.sub(patch.y.mul(2)).mul(2));
     const isLead = quadIdx.equal(floor(hash(patchSeed.add(uint(3))).mul(4)));
     const patchCentre = patch.add(0.5).mul(spacing.mul(2)).sub(spacing);
-    const patchPad = mx_noise_float(vec3(patchCentre.div(230), 3.7)).greaterThan(PAD_CLUSTER);
+    const patchPad = mx_noise_float(vec3(patchCentre.div(230), PAD_NOISE_Z)).greaterThan(PAD_CLUSTER);
     const isPadNode = isBg.and(select(merged, isLead.and(patchPad), padField.greaterThan(PAD_CLUSTER)));
     const isBigPad = isPadNode.and(merged);
     const isWater = isBg.and(isPadNode.not());
@@ -1545,10 +1549,10 @@ async function main() {
 
   // ---------------------------------------------------- render: dragonflies
 
-  // A dragonfly, top-down, as simple and cute as the ducks: two chubby
-  // blobs in flat colour, each with the same lit rim (top left) and thin
-  // darker edge as the pads' and ducks' cells (a big round head, a short
-  // teardrop body), and four round clear petal wings spread in an X.
+  // A dragonfly, top-down, as simple and cute as the ducks: one chubby
+  // rounded pill of a body in flat colour, with the same lit rim (top left)
+  // and thin darker edge as the pads' and ducks' cells, and four round
+  // clear wings spread out sideways (the classic dragonfly cross).
   // Flying, the wings beat into a shimmer (they foreshorten and fade, fore
   // and hind pairs out of step); perched, they lie flat and still. Its
   // shadow falls on the water down and to the right, further and softer the
@@ -1556,7 +1560,9 @@ async function main() {
   // pass (its own render pass cost ~2ms at Retina size). (A first take
   // with segment bands, wing veins, tip spots and eye glints was too
   // detailed next to the ducks; so was a second with two eye beads, a
-  // thorax and a long thin abdomen.)
+  // thorax and a long thin abdomen; a third with a separate darker head;
+  // and a fourth blending that head into a teardrop tail looked like a
+  // matchstick.)
   const flyMesh = (() => {
     const material = new THREE.MeshBasicNodeMaterial({ transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide }); // (y is flipped into screen space)
     const A = uFlyA.element(instanceIndex);
@@ -1590,25 +1596,32 @@ async function main() {
         const d = q.sub(c);
         return length(vec2(dot(d, u).div(L), dot(d, vec2(u.y.negate(), u.x)).div(W))).sub(1).mul(min(L, W));
       };
-      // Body pieces: distance and the outward direction (for the rim light).
-      const disc = (q, c, r) => ({ d: length(q.sub(c)).sub(r), n: normalize(q.sub(c).add(vec2(1e-4, 0))) });
-      const taper = (q, a, b, r0, r1) => {
-        const pa = q.sub(a);
-        const ba = b.sub(a);
-        const h = clamp(dot(pa, ba).div(dot(ba, ba)), 0, 1);
-        const off = pa.sub(ba.mul(h));
-        return { d: length(off).sub(mix(r0, r1, h)), n: normalize(off.add(vec2(1e-4, 0))) };
+      // The body: one chubby rounded pill, a little narrower at the tail (an
+      // uneven capsule: head circle r1 at x=X0, tail circle r2 H behind it,
+      // exact distance), with its distance and outward direction (for the
+      // rim light). Widest where the wings meet it, so with the wings spread
+      // sideways it reads as a dragonfly rather than a knob on a stick.
+      const body = (q) => {
+        const X0 = 5.5, R1 = 2.9, R2 = 2.2, H = 14;
+        const B = (R1 - R2) / H;
+        const A = Math.sqrt(1 - B * B);
+        const across = abs(q.y);
+        const along = float(X0).sub(q.x); // (towards the tail)
+        const k = across.mul(-B).add(along.mul(A));
+        const head = vec2(across, along);
+        const tail = vec2(across, along.sub(H));
+        const d = select(k.lessThan(0), length(head).sub(R1), select(k.greaterThan(A * H), length(tail).sub(R2), across.mul(A).add(along.mul(B)).sub(R1)));
+        const m = select(k.lessThan(0), normalize(head.add(vec2(1e-4, 0))), select(k.greaterThan(A * H), normalize(tail.add(vec2(1e-4, 0))), vec2(A, B)));
+        return { d, n: vec2(m.y.negate(), m.x.mul(select(q.y.lessThan(0), float(-1), float(1)))) };
       };
-      const pieces = (q) => [
-        { ...taper(q, vec2(2, 0), vec2(-10, 0), float(3.2), float(1.5)), col: vec3(uFly) },
-        { ...disc(q, vec2(6.4, 0), 3.8), col: mix(vec3(uFly), uFlyDark, 0.45) },
-      ];
-      // Wings: fore pair, then hind pair; beating, each foreshortens (and
-      // fades) through its stroke.
+      const pieces = (q) => [{ ...body(q), col: vec3(uFly) }];
+      // Wings: fore pair, then hind pair, spread out sideways (fore a little
+      // forward, hind a little back); beating, each foreshortens (and fades)
+      // through its stroke.
       const beat = (lag) => mix(float(1), abs(cos(uTime.mul(Math.PI * 2 * 26).add(vFly.w.mul(1.7)).add(lag))).mul(0.5).add(0.5), flap);
       const wings = [
-        { root: vec2(2.4, 0), dx: 0.5, L: 6.2, W: 3.3, lag: 0 },
-        { root: vec2(-0.2, 0), dx: -0.4, L: 5.8, W: 3.3, lag: Math.PI / 2 },
+        { root: vec2(1.6, 0), dx: 0.25, L: 7.2, W: 3.4, lag: 0 },
+        { root: vec2(-0.6, 0), dx: -0.2, L: 6.8, W: 3.6, lag: Math.PI / 2 },
       ].flatMap((w) =>
         [-1, 1].map((side) => {
           const u = normalize(vec2(w.dx, side));
@@ -1985,7 +1998,7 @@ async function main() {
   let firstLayout = true;
 
   const layout = () => {
-    const rand = mulberry32(1337);
+    const rand = mulberry32(1337 + POND_SEED);
     const sx = scrollX;
     const sy = scrollY;
     const docW = Math.max(document.documentElement.scrollWidth, innerWidth);
@@ -2948,8 +2961,9 @@ async function main() {
   // A dart from where it is to (tx, ty) at about `speed` px/s. Real
   // dragonflies fly direct but not ruler-straight: each dart bows into a
   // gentle arc (to a random side), speeds up and slows down, and flutters a
-  // little sideways on the way.
-  const startDart = (f, tx, ty, speed, maxTime = 1.4) => {
+  // little sideways on the way. A bolt (startled off its pad) starts at full
+  // speed instead and only slows toward the end.
+  const startDart = (f, tx, ty, speed, maxTime = 1.4, bolt = false) => {
     const d = Math.hypot(tx - f.x, ty - f.y);
     Object.assign(f, {
       sx: f.x,
@@ -2958,11 +2972,12 @@ async function main() {
       ty,
       bow: (Math.random() < 0.5 ? -1 : 1) * between(0.1, 0.3),
       dartT: 0,
-      dartFor: Math.min(Math.max(d / speed, 0.3), maxTime),
+      dartFor: Math.min(Math.max(d / speed, bolt ? 0.2 : 0.3), maxTime),
+      bolt,
     });
   };
   // Somewhere lo-hi px away to dart to, in view.
-  const pickDart = (f, lo, hi) => {
+  const pickDart = (f, lo, hi, speed = between(300, 420), bolt = false) => {
     const m = 50;
     for (let k = 0; k < 12; k++) {
       const a = Math.random() * Math.PI * 2;
@@ -2970,11 +2985,11 @@ async function main() {
       const tx = f.x + Math.cos(a) * d;
       const ty = f.y + Math.sin(a) * d;
       if (tx > scrollX + m && tx < scrollX + innerWidth - m && ty > scrollY + m && ty < scrollY + innerHeight - m) {
-        startDart(f, tx, ty, between(300, 420));
+        startDart(f, tx, ty, speed, 1.4, bolt);
         return;
       }
     }
-    startDart(f, scrollX + innerWidth * between(0.2, 0.8), scrollY + innerHeight * between(0.2, 0.8), between(300, 420));
+    startDart(f, scrollX + innerWidth * between(0.2, 0.8), scrollY + innerHeight * between(0.2, 0.8), speed, 1.4, bolt);
   };
   const spawnFly = (f) => {
     const w = route(40);
@@ -3006,9 +3021,14 @@ async function main() {
   // curve), which the dragonfly follows on a stiff spring. Returns how far
   // it still is from the end.
   const flyAlong = (f, dt, k = 90, cap = 560) => {
+    if (f.bolt) {
+      // (A bolt: a stiffer spring and a higher top speed.)
+      k = 160;
+      cap = 1000;
+    }
     f.dartT += dt;
     const k1 = Math.min(f.dartT / f.dartFor, 1);
-    const u = k1 * k1 * (3 - 2 * k1);
+    const u = f.bolt ? 1 - (1 - k1) ** 3 : k1 * k1 * (3 - 2 * k1);
     const dx = f.tx - f.sx;
     const dy = f.ty - f.sy;
     // (The curve's middle control point: off to one side of the straight
@@ -3048,7 +3068,9 @@ async function main() {
     f.pad = -1;
     f.target = -1;
     f.perches++;
-    pickDart(f, startled ? 160 : 90, startled ? 300 : 220);
+    // Startled, it bolts: straight up off the pad and away, fast.
+    if (startled) pickDart(f, 180, 320, between(650, 800), true);
+    else pickDart(f, 90, 220);
     setFly(f, "takeoff");
   };
   // (Follow the pad it's going for or sitting on, from the GPU's answers.)
@@ -3073,8 +3095,10 @@ async function main() {
       const left = flyAlong(f, dt);
       faceMotion(f, dt);
       if (f.mode === "takeoff") {
-        f.alt = FLY_ALT * Math.min(1, f.modeT / 0.3) ** 0.5;
-        if (f.modeT > 0.3) setFly(f, "dart");
+        // (A bolt lifts off in a blink.)
+        const lift = f.bolt ? 0.1 : 0.3;
+        f.alt = FLY_ALT * Math.min(1, f.modeT / lift) ** 0.5;
+        if (f.modeT > lift) setFly(f, "dart");
       } else if (f.dartT >= f.dartFor && left < 3 && Math.hypot(f.vx, f.vy) < 30) {
         setFly(f, "hover");
         f.hoverFor = between(0.3, 1.3);
@@ -3348,7 +3372,9 @@ function mulberry32(a) {
 }
 
 // Bottom-right dev menu: fps meter, debug overlay toggle, effects on/off link.
+// (Pages without one, like /pond, skip it.)
 function setupDevMenu() {
+  if (!document.querySelector(".dev-menu")) return;
   const fpsEl = document.getElementById("dev-fps");
   const debugEl = document.getElementById("dev-debug");
   const fxEl = document.getElementById("dev-fx");
