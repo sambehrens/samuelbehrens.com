@@ -112,8 +112,21 @@ const PAD_SWAY = 60; // how far pads sway with passing waves (px per unit slope)
 const TEXT_SWAY = 18; // how far letters' cells sway with passing waves (px per unit slope)
 const TEXT_SWAY_MAX = 2; // css px, cap on a letter cell's sway (keeps letters legible)
 const DUCK_PADDLE = 6; // how hard its feet paddle
+const DUCKLING_PADDLE = 1.2; // (per unit of slow-layer stiffness, which is ~5.7x a duck's for its smaller feet)
 const FACET = 9; // css px, size of the water mosaic's cells
-const MAX_DUCKS = 2;
+const MAX_DUCKS = 2; // big ducks
+// Ducklings: about half the ducks bring a brood of 3-4 that swim in a line
+// behind them. They live in duck slots after the big ducks' (slot >=
+// MAX_DUCKS) and are drawn, shoved and pushed by waves just like ducks.
+const MAX_DUCKLINGS = 8;
+const DUCK_SLOTS = MAX_DUCKS + MAX_DUCKLINGS;
+const BROOD_CHANCE = 0.5;
+const CHICK = 0.46; // a duckling's size relative to a duck
+const DUCKLING_WAVE_PUSH = 1.5; // waves push a duckling this many times harder than a duck
+const DUCKLING_LOST = 70; // css px from its place in line before a duckling loses the line
+const DUCKLING_SCATTER = 45; // css px/s of wave drift that scatters a duckling at once
+const DUCKLING_RUSH = 4.2; // how fast a lost duckling hurries back (x DUCK_SPEED)
+const DUCKLING_JOIN = 24; // css px from its new place when it joins a line
 const DUCK_SCALE = 2; // the duck is ~38 css px long at scale 1
 const DUCK_R = 24 * DUCK_SCALE; // rough radius of a duck, css px
 const DUCK_SPEED = 38; // average swimming speed, css px/s
@@ -121,6 +134,7 @@ const DUCK_WAVE_PUSH = 600; // how hard waves push a duck (per unit of wave ener
 // Duck cell parts (attr.w); +10 marks cells that ride on the bobbing head.
 const PART_BODY = 1;
 const PART_BILL = 2;
+const PART_CHICK = 3; // a duckling's (yellow) body
 
 // A duck, top-down, is a handful of big weighted cells drawn like the lily
 // pads (see padShader): a tail, two pairs of body cells (the seam down the
@@ -139,6 +153,30 @@ const duckCells = (() => {
     { x: 15.2, y: 0, r: 4.4, part: PART_BILL + 10 },
   ].map((c) => ({ x: c.x * S, y: c.y * S, r: c.r * S, part: c.part }));
 })();
+// A duckling: a round fluffy body, a big head and a little bill. (Split
+// into more cells, like the duck, it read as a scatter of petals at this
+// size.)
+const chickCells = (() => {
+  const S = DUCK_SCALE * CHICK;
+  return [
+    { x: -4, y: 0, r: 8.8, part: PART_CHICK },
+    { x: 8.5, y: 0, r: 7.6, part: PART_CHICK + 10 },
+    { x: 16.5, y: 0, r: 3.7, part: PART_BILL + 10 },
+  ].map((c) => ({ x: c.x * S, y: c.y * S, r: c.r * S, part: c.part }));
+})();
+const isChickSlot = (i) => i >= MAX_DUCKS;
+const slotCells = (i) => (isChickSlot(i) ? chickCells : duckCells);
+const slotScale = (i) => (isChickSlot(i) ? CHICK : 1);
+// How far a duck's cells reach ahead / behind (rx) and to the side (ry).
+const slotExtent = (i) => {
+  const cells = slotCells(i);
+  return {
+    rx: Math.max(...cells.map((c) => Math.abs(c.x) + c.r)),
+    ry: Math.max(...cells.map((c) => Math.abs(c.y) + c.r)),
+    back: Math.max(...cells.map((c) => c.r - c.x)),
+    front: Math.max(...cells.map((c) => c.x + c.r)),
+  };
+};
 
 const PALETTES = {
   light: {
@@ -155,6 +193,7 @@ const PALETTES = {
     text: "#f6f1e3",
     deep: "#10283a",
     accent: "#ffb82b",
+    duckling: "#ffd94a",
   },
   dark: {
     water: "#0f3149",
@@ -170,6 +209,7 @@ const PALETTES = {
     text: "#efe9da",
     deep: "#081a26",
     accent: "#ffb82b",
+    duckling: "#f2cf4e",
   },
 };
 
@@ -235,9 +275,10 @@ async function main() {
   const uNW = uniform(1, "int"); // block grid (jump flood, neighbour lists): one entry per 2x2 cells
   const uNH = uniform(1, "int");
   // Ducks (viewport px): xy position, zw unit heading. Parked far away when idle.
-  const duckData = Array.from({ length: MAX_DUCKS }, () => new THREE.Vector4(-1e5, -1e5, 1, 0));
+  // (All duck slots: the big ducks, then the ducklings.)
+  const duckData = Array.from({ length: DUCK_SLOTS }, () => new THREE.Vector4(-1e5, -1e5, 1, 0));
   const uDucks = uniformArray(duckData, "vec4");
-  const duckVel = Array.from({ length: MAX_DUCKS }, () => new THREE.Vector4());
+  const duckVel = Array.from({ length: DUCK_SLOTS }, () => new THREE.Vector4());
   const uDuckVel = uniformArray(duckVel, "vec4"); // xy velocity, z body bend
   // Wave grid (viewport-sized, anchored to the document so waves scroll
   // with the page): size, the document position of cell (0,0)'s corner, how
@@ -280,6 +321,7 @@ async function main() {
     text: uText,
     deep: uDeep,
     accent: uAccent,
+    duckling: uDuckling,
   } = palette;
 
   const applyPalette = () => {
@@ -438,15 +480,22 @@ async function main() {
       }
       // Ducks: the body presses a dent that travels with it (a moving dent
       // makes a wake), and the paddling feet behind it pulse.
-      for (let i = 0; i < MAX_DUCKS; i++) {
+      // (Ducklings: smaller feet, a quicker, gentler paddle.)
+      for (let i = 0; i < DUCK_SLOTS; i++) {
+        const S = DUCK_SCALE * slotScale(i);
+        const chick = isChickSlot(i);
         const duck = uDucks.element(i);
         const at2 = duck.xy.add(uScroll);
-        const body = c.sub(at2.sub(duck.zw.mul(3 * DUCK_SCALE)));
-        const feet = c.sub(at2.sub(duck.zw.mul(11 * DUCK_SCALE)));
-        const gBody = exp(dot(body, body).div(-((12 * DUCK_SCALE) ** 2)));
-        const gFeet = exp(dot(feet, feet).div(-((6 * DUCK_SCALE) ** 2)));
-        const paddle = sin(uTime.mul(Math.PI * 2 * WAVE_FREQ[1]).add(i * 2.1));
-        force.addAssign(vec2(0, gBody.mul(-DUCK_PRESS).mul(stiff(12 * DUCK_SCALE).y).add(gFeet.mul(paddle).mul(DUCK_PADDLE).mul(stiff(6 * DUCK_SCALE).y))));
+        const feet = c.sub(at2.sub(duck.zw.mul((chick ? 7 : 11) * S)));
+        const gFeet = exp(dot(feet, feet).div(-((6 * S) ** 2)));
+        const paddle = sin(uTime.mul(Math.PI * 2 * WAVE_FREQ[1] * (chick ? 1.6 : 1)).add(i * 2.1));
+        const slowStiff = (r) => WAVE_SPEED[1] ** 2 / r ** 2;
+        let push = gFeet.mul(paddle).mul((chick ? DUCKLING_PADDLE : DUCK_PADDLE) * slowStiff(6 * S));
+        if (DUCK_PRESS) {
+          const body = c.sub(at2.sub(duck.zw.mul(3 * S)));
+          push = push.add(exp(dot(body, body).div(-((12 * S) ** 2))).mul(-DUCK_PRESS * slowStiff(12 * S)));
+        }
+        force.addAssign(vec2(0, push));
       }
 
       const h = vec2(C.x, C.z);
@@ -478,16 +527,18 @@ async function main() {
   // duck: that flux (fast layer only: the cursor's waves; the slow layer is
   // mostly the duck's own paddling) averaged over a disc around it, read
   // back to the CPU, which steers the duck (see updateDucks).
-  const duckWave = instancedArray(MAX_DUCKS, "vec4"); // xy flux, z energy
+  const duckWave = instancedArray(DUCK_SLOTS, "vec4"); // xy flux, z energy
   const duckWavePass = (buf) =>
     Fn(() => {
       const duck = uDucks.element(instanceIndex);
       const centre = duck.xy.add(uScroll);
+      // (A duckling feels the water over a smaller disc.)
+      const R = select(int(instanceIndex).lessThan(MAX_DUCKS), float(DUCK_R), float(DUCK_R * CHICK)).toVar();
       const sum = vec4(0).toVar();
       const cell = (qx, qy) => buf.element(max(min(qy, uWH.sub(1)), int(0)).mul(uWW).add(max(min(qx, uWW.sub(1)), int(0))));
       Loop(81, ({ i }) => {
-        const off = vec2(float(i.mod(9)).sub(4), float(i.div(9)).sub(4)).mul(DUCK_R / 4.5);
-        const w = exp(dot(off, off).div(-((DUCK_R * 0.7) ** 2)));
+        const off = vec2(float(i.mod(9)).sub(4), float(i.div(9)).sub(4)).mul(R.div(4.5));
+        const w = exp(dot(off, off).div(R.mul(R).mul(-0.49)));
         const u = centre.add(off).sub(uWaveOrigin).div(WAVE_CELL);
         const qx = int(floor(u.x));
         const qy = int(floor(u.y));
@@ -499,9 +550,9 @@ async function main() {
         });
       });
       duckWave.element(instanceIndex).assign(sum.div(max(sum.w, 1e-3)));
-    })().compute(MAX_DUCKS);
+    })().compute(DUCK_SLOTS);
   const duckWavePasses = [duckWavePass(waveA), duckWavePass(waveB)];
-  const duckPush = Array.from({ length: MAX_DUCKS }, () => ({ x: 0, y: 0, e: 0 }));
+  const duckPush = Array.from({ length: DUCK_SLOTS }, () => ({ x: 0, y: 0, e: 0 }));
   let duckWaveBusy = false;
   const readDuckWaves = () => {
     if (duckWaveBusy) return;
@@ -510,7 +561,7 @@ async function main() {
       .getArrayBufferAsync(duckWave.value)
       .then((ab) => {
         const a = new Float32Array(ab);
-        for (let i = 0; i < MAX_DUCKS; i++) Object.assign(duckPush[i], { x: a[i * 4] || 0, y: a[i * 4 + 1] || 0, e: a[i * 4 + 2] || 0 });
+        for (let i = 0; i < DUCK_SLOTS; i++) Object.assign(duckPush[i], { x: a[i * 4] || 0, y: a[i * 4 + 1] || 0, e: a[i * 4 + 2] || 0 });
         if (params.has("duckwave")) window.__duckWave = duckPush.map((d) => ({ ...d }));
       })
       .finally(() => (duckWaveBusy = false));
@@ -620,11 +671,12 @@ async function main() {
     const energy = max(f.x.mul(exp(uDt.mul(-1.4))), splat).toVar();
     const flow = mix(f.yz.mul(exp(uDt.mul(-2.2))), uMouseVel, clamp(splat, 0, 1)).toVar();
     // Ducks stir the water too, leaving a gentler wake behind them.
-    for (let i = 0; i < MAX_DUCKS; i++) {
+    for (let i = 0; i < DUCK_SLOTS; i++) {
       const duck = uDucks.element(i);
+      const R = DUCK_R * slotScale(i);
       // Centred behind the duck so it doesn't shake its own cells apart.
-      const dd = c.sub(duck.xy.sub(duck.zw.mul(DUCK_R * 1.3)));
-      const duckSplat = exp(dot(dd, dd).div(-DUCK_R * DUCK_R)).mul(0.4);
+      const dd = c.sub(duck.xy.sub(duck.zw.mul(R * 1.3)));
+      const duckSplat = exp(dot(dd, dd).div(-R * R)).mul(isChickSlot(i) ? 0.25 : 0.4);
       energy.assign(max(energy, duckSplat));
       flow.assign(mix(flow, duck.zw.mul(DUCK_SPEED * 6), clamp(duckSplat, 0, 1)));
     }
@@ -723,7 +775,9 @@ async function main() {
     const duck = uDucks.element(duckIdx);
     const duckV = select(isDuck, uDuckVel.element(duckIdx).xy, vec2(0));
     const onHead = A.w.greaterThan(9.5);
-    const bob = sin(uTime.mul(1.4).add(A.x.mul(40))).mul(1.2 * DUCK_SCALE);
+    const isChick = duckIdx.greaterThanEqual(MAX_DUCKS);
+    // (Ducklings bob their heads quicker.)
+    const bob = sin(uTime.mul(select(isChick, float(2.6), float(1.4))).add(A.x.mul(40))).mul(select(isChick, float(0.9 * DUCK_SCALE * CHICK), float(1.2 * DUCK_SCALE)));
     const straight = Hm.xy.add(vec2(0, select(onHead, bob, float(0))));
     // Bend the body along its turn: rotating each cell by an angle
     // proportional to how far forward it is curls head and tail into an arc.
@@ -757,9 +811,11 @@ async function main() {
     // of one grown by their radius, so a duck parts them like real ones
     // instead of overlapping them.
     const padReach = select(isPadNode, padSize.mul(0.9), float(0));
-    const rx = padReach.add(21 * DUCK_SCALE + 4); // tail (-21) to bill tip (21), plus margin
-    const ry = padReach.add(11 * DUCK_SCALE + 4);
-    for (let i = 0; i < MAX_DUCKS; i++) {
+    for (let i = 0; i < DUCK_SLOTS; i++) {
+      // (Tail to bill tip and side to side, plus a margin.)
+      const ext = slotExtent(i);
+      const rx = padReach.add(ext.rx + 4);
+      const ry = padReach.add(ext.ry + 4);
       const other = uDucks.element(i);
       const away = p.sub(uScroll).sub(other.xy);
       const side = vec2(other.w.negate(), other.z);
@@ -819,7 +875,7 @@ async function main() {
     const lifted = clamp(lift.mul(0.35).add(0.45), 0.02, 0.9);
     const surface = select(
       isDuck,
-      part.add(3).add(lifted), // 4 body / 5 bill
+      part.add(3).add(lifted), // 4 body / 5 bill / 6 duckling body
       select(
         isInk,
         float(2).add(hover.mul(G.y).mul(0.9)),
@@ -1092,7 +1148,7 @@ async function main() {
 
 
   // Lily pads and duck cells ("leaves") are weighted cells drawn by the pad
-  // pass; surface codes 1 (pad), 4 (duck body), 5 (bill).
+  // pass; surface codes 1 (pad), 4 (duck body), 5 (bill), 6 (duckling body).
   const isLeafCode = (x) => {
     const code = floor(x);
     return code.equal(1).or(code.greaterThan(3.5));
@@ -1141,7 +1197,8 @@ async function main() {
       const size = max(spacing.mul(a1), 0.5);
           const r = spacing; // (a pad's radius)
           const isDuck = floor(look.x).greaterThan(3.5);
-          const isBill = floor(look.x).greaterThan(4.5);
+          const isBill = floor(look.x).equal(5);
+          const isChick = floor(look.x).equal(6);
           const base = id.mul(5);
           const pe2 = float(1e6).toVar();
           const pe3 = float(1e6).toVar();
@@ -1183,9 +1240,10 @@ async function main() {
           const leafFill = float(1).sub(smoothstep(aa.negate(), aa, leaf)); // (without the notch, for the flower)
 
           // Pads: two greens per pad. Ducks: the page's colours, text-cream
-          // body and accent-orange bill. Each with a lighter and darker tone
-          // for the light; lighter riding a crest, darker in a trough.
-          const duckBase = select(isBill, vec3(uAccent), vec3(uText));
+          // body and accent-orange bill (ducklings: a downy yellow body).
+          // Each with a lighter and darker tone for the light; lighter riding
+          // a crest, darker in a trough.
+          const duckBase = select(isBill, vec3(uAccent), select(isChick, vec3(uDuckling), vec3(uText)));
           const baseCol = select(isDuck, duckBase, mix(uPad, uPadLight, fract(rnd.mul(13.7))));
           const light = select(isDuck, mix(duckBase, vec3(1), 0.45), vec3(uPadLight).mul(1.18));
           const shade = select(isDuck, duckBase.mul(select(isBill, float(0.8), float(0.82))), vec3(uPadRim));
@@ -1702,8 +1760,8 @@ async function main() {
 
     // Ducks: a few hundred cells each (attr.x = which duck, attr.w = part),
     // home = position in the duck's frame; the GPU carries them along.
-    for (let d = 0; d < MAX_DUCKS; d++) {
-      for (const c of duckCells) push(c.x, c.y, 0, KIND_DUCK, d, c.r, c.part);
+    for (let d = 0; d < DUCK_SLOTS; d++) {
+      for (const c of slotCells(d)) push(c.x, c.y, 0, KIND_DUCK, d, c.r, c.part);
     }
 
     // Background: a jittered grid over the whole document (plus a margin so
@@ -1873,11 +1931,77 @@ async function main() {
   // Each duck enters from a random edge, heads for a random point on the
   // opposite edge with a lazily swaying heading, and leaves. Then it rests a
   // while before coming back.
-  const ducks = Array.from({ length: MAX_DUCKS }, (_, i) => ({ active: false, wait: 1.5 + i * 5 + Math.random() * 3 }));
-  // ?ducktest drops the first duck straight into open water, for tuning.
+  //
+  // About half of them bring a brood of 3-4 ducklings (the slots after the
+  // big ducks'). Each duckling follows the duck in front of it on a short
+  // rope, so they trail in a line. Waves push ducklings much harder than
+  // ducks; one knocked too far from its place (or startled by a hard push)
+  // loses its line, which closes up behind it. After a moment's daze it
+  // hurries to the nearest duck and joins the end of that duck's line.
+  const ducks = Array.from({ length: DUCK_SLOTS }, (_, i) => ({
+    active: false,
+    chick: isChickSlot(i),
+    leader: -1,
+    wait: 1.5 + i * 5 + Math.random() * 3,
+  }));
+  const extents = Array.from({ length: DUCK_SLOTS }, (_, i) => slotExtent(i));
+  // Centre-to-centre distance of duckling i swimming behind duck j (clear of
+  // each other's shove ellipses, see nodeUpdate).
+  const gapBehind = (j, i) => extents[j].back + extents[i].front + (isChickSlot(j) ? 6 : 10);
+  // ?ducktest drops the first duck straight into open water, for tuning
+  // (always with a brood).
   const duckTest = params.has("ducktest");
   if (duckTest) ducks[0].wait = 0;
   const between = (a, b) => a + Math.random() * (b - a);
+  const offScreen = (d, m) => {
+    const vx = d.x - scrollX;
+    const vy = d.y - scrollY;
+    return vx < -m || vy < -m || vx > innerWidth + m || vy > innerHeight + m;
+  };
+  // A duck in a line: a big duck, or a duckling whose leaders lead to one.
+  const motherOf = (i) => {
+    for (let k = 0; k <= DUCK_SLOTS && i >= 0; k++) {
+      const d = ducks[i];
+      if (!d.active) return -1;
+      if (!d.chick) return i;
+      i = d.leader;
+    }
+    return -1;
+  };
+  // The last duck of i's line.
+  const tailOf = (i) => {
+    for (let k = 0; k <= DUCK_SLOTS; k++) {
+      const next = ducks.findIndex((c) => c.active && c.chick && c.leader === i);
+      if (next < 0) return i;
+      i = next;
+    }
+    return i;
+  };
+  // Duckling i leaves its line; the one behind it moves up.
+  const loseLine = (c, i) => {
+    for (const b of ducks) if (b.active && b.chick && b.leader === i) b.leader = c.leader;
+    c.leader = -1;
+    c.daze = 0.35;
+  };
+  const spawnChick = (c, x, y, heading, leader) => {
+    Object.assign(c, {
+      active: true,
+      age: 0,
+      x,
+      y,
+      heading,
+      leader,
+      phase: Math.random() * 100,
+      sx: 0, // swimming velocity
+      sy: 0,
+      vx: 0,
+      vy: 0,
+      bend: 0,
+      dx: 0,
+      dy: 0,
+      daze: 0,
+    });
+  };
   const spawnDuck = (d, i) => {
     const w = innerWidth;
     const h = innerHeight;
@@ -1915,68 +2039,199 @@ async function main() {
       const [fx = 0.7, fy = 0.45, fh = 0] = (params.get("ducktest") || "").split(",").filter(Boolean).map(Number);
       Object.assign(d, { x: scrollX + innerWidth * fx, y: scrollY + innerHeight * fy, base: fh, heading: fh, age: 3 });
     }
+    // The brood, lined up behind her.
+    if (Math.random() < BROOD_CHANCE || (duckTest && i === 0)) {
+      const free = [];
+      ducks.forEach((c, ci) => c.chick && !c.active && free.push(ci));
+      const n = Math.min(free.length, Math.random() < 0.5 ? 3 : 4);
+      let lead = i;
+      let x = d.x;
+      let y = d.y;
+      for (let k = 0; k < n; k++) {
+        const ci = free[k];
+        const g = gapBehind(lead, ci);
+        x -= Math.cos(d.heading) * g;
+        y -= Math.sin(d.heading) * g;
+        spawnChick(ducks[ci], x, y, d.heading, lead);
+        lead = ci;
+      }
+    }
+  };
+  // Waves push a duck: the water's push (wave energy flux around it, from
+  // the GPU) drives a drift velocity that water drag slows down. Returns how
+  // fast it's drifting.
+  const waveDrift = (d, i, gain, cap, dragRate, dt) => {
+    const w = duckPush[i];
+    let ax = w.x * gain;
+    let ay = w.y * gain;
+    const al = Math.hypot(ax, ay);
+    if (al > cap) {
+      ax *= cap / al;
+      ay *= cap / al;
+    }
+    const drag = Math.exp(-dt * dragRate);
+    d.dx = (d.dx + ax * dt) * drag;
+    d.dy = (d.dy + ay * dt) * drag;
+    return Math.hypot(d.dx, d.dy);
+  };
+  const updateDuck = (d, i, dt, t) => {
+    d.age += dt;
+    // A pushed duck turns to go with the waves, the more the harder it's
+    // pushed, and paddles a little faster for a moment, as if startled.
+    const drift = waveDrift(d, i, DUCK_WAVE_PUSH, 160, 2.2, dt);
+    if (drift > 2) {
+      const want = Math.atan2(d.dy, d.dx);
+      const diff = Math.atan2(Math.sin(want - d.base), Math.cos(want - d.base));
+      d.base += diff * Math.min(1, drift / 30) * (1 - Math.exp(-dt * 1.6));
+    }
+    d.startle = Math.max(d.startle * Math.exp(-dt * 0.8), Math.min(1, drift / 40));
+    // Weave: a slow meander plus a quicker side-to-side.
+    const sway = 0.7 * Math.sin(t * 0.45 + d.phase) + 0.35 * Math.sin(t * 1.15 + d.phase * 1.7);
+    const before = d.heading;
+    d.heading += (d.base + sway - d.heading) * (1 - Math.exp(-dt * 2));
+    // Body bend follows the turn rate (curvature of the path, exaggerated).
+    const turn = (d.heading - before) / Math.max(dt, 1e-3);
+    d.bend += (Math.max(-0.012, Math.min(0.012, (turn / d.speed) * 0.9)) - d.bend) * (1 - Math.exp(-dt * 5));
+    // Paddle-and-glide rhythm.
+    const v = d.speed * (0.8 + 0.25 * Math.sin(t * 2.2 + d.phase)) * (1 + 0.6 * d.startle);
+    d.vx = Math.cos(d.heading) * v + d.dx;
+    d.vy = Math.sin(d.heading) * v + d.dy;
+    d.x += d.vx * dt;
+    d.y += d.vy * dt;
+    // She leaves once she and her whole brood are out of view.
+    const brood = ducks.some((c, ci) => c.active && c.chick && motherOf(ci) === i && !offScreen(c, DUCK_R));
+    if (d.age > 2 && offScreen(d, DUCK_R * 2) && !brood) {
+      d.active = false;
+      d.wait = between(3, 10);
+    }
+  };
+  const updateChick = (c, i, dt, t) => {
+    c.age += dt;
+    // Light: waves shove ducklings about more than ducks (but they paddle
+    // against it, so it dies down sooner).
+    const drift = waveDrift(c, i, DUCK_WAVE_PUSH * DUCKLING_WAVE_PUSH, 260, 3.2, dt);
+    if (c.leader >= 0 && !ducks[c.leader].active) c.leader = -1;
+    let tx = c.x;
+    let ty = c.y;
+    let tvx = 0;
+    let tvy = 0;
+    let maxSpeed = DUCK_SPEED * 1.8;
+    if (c.leader >= 0) {
+      // Follow on a rope: a spot a gap away from the leader, on the line
+      // toward this duckling but pulled round behind the leader.
+      const L = ducks[c.leader];
+      const ox = c.x - L.x;
+      const oy = c.y - L.y;
+      const ol = Math.hypot(ox, oy) || 1;
+      let ux = ox / ol - Math.cos(L.heading) * 0.6;
+      let uy = oy / ol - Math.sin(L.heading) * 0.6;
+      const ul = Math.hypot(ux, uy) || 1;
+      const g = gapBehind(c.leader, i);
+      tx = L.x + (ux / ul) * g;
+      ty = L.y + (uy / ul) * g;
+      tvx = L.vx;
+      tvy = L.vy;
+      if (Math.hypot(tx - c.x, ty - c.y) > DUCKLING_LOST || drift > DUCKLING_SCATTER) loseLine(c, i);
+    }
+    if (c.leader < 0) {
+      c.daze -= dt;
+      // Lost: hurry to the nearest duck in a line, and join the end of it.
+      let near = -1;
+      let nd = Infinity;
+      ducks.forEach((o, j) => {
+        if (j === i || !o.active || motherOf(j) < 0) return;
+        const dist = Math.hypot(o.x - c.x, o.y - c.y);
+        if (dist < nd) {
+          nd = dist;
+          near = j;
+        }
+      });
+      if (near >= 0) {
+        const tail = tailOf(near);
+        const T = ducks[tail];
+        const g = gapBehind(tail, i);
+        tx = T.x - Math.cos(T.heading) * g;
+        ty = T.y - Math.sin(T.heading) * g;
+        tvx = T.vx;
+        tvy = T.vy;
+        maxSpeed = DUCK_SPEED * DUCKLING_RUSH;
+        if (Math.hypot(tx - c.x, ty - c.y) < DUCKLING_JOIN) c.leader = tail;
+      } else {
+        // Nobody left to follow: paddle on out of the pond.
+        tvx = Math.cos(c.heading) * DUCK_SPEED;
+        tvy = Math.sin(c.heading) * DUCK_SPEED;
+      }
+      if (c.daze > 0) {
+        // (Dazed for a moment after being knocked away: just drifts.)
+        tx = c.x;
+        ty = c.y;
+        tvx = 0;
+        tvy = 0;
+      }
+    }
+    let vx = tvx + (tx - c.x) * 2.4;
+    let vy = tvy + (ty - c.y) * 2.4;
+    const vl = Math.hypot(vx, vy);
+    if (vl > maxSpeed) {
+      vx *= maxSpeed / vl;
+      vy *= maxSpeed / vl;
+    }
+    // Keep out of other ducks' way.
+    ducks.forEach((o, j) => {
+      if (j === i || !o.active) return;
+      const ax = c.x - o.x;
+      const ay = c.y - o.y;
+      const al = Math.hypot(ax, ay) || 1;
+      const minD = extents[i].rx + extents[j].ry + 4;
+      if (al < minD) {
+        vx += (ax / al) * (minD - al) * 5;
+        vy += (ay / al) * (minD - al) * 5;
+      }
+    });
+    // Little paddling spurts.
+    const spurt = 0.85 + 0.3 * Math.sin(t * 4.5 + c.phase);
+    const k = 1 - Math.exp(-dt * 4);
+    c.sx += (vx * spurt - c.sx) * k;
+    c.sy += (vy * spurt - c.sy) * k;
+    const before = c.heading;
+    const sl = Math.hypot(c.sx, c.sy);
+    if (sl > 4) {
+      const want = Math.atan2(c.sy, c.sx);
+      c.heading += Math.atan2(Math.sin(want - c.heading), Math.cos(want - c.heading)) * (1 - Math.exp(-dt * 6));
+    }
+    const turn = (c.heading - before) / Math.max(dt, 1e-3);
+    c.bend += (Math.max(-0.03, Math.min(0.03, (turn / Math.max(sl, 20)) * 0.9)) - c.bend) * (1 - Math.exp(-dt * 5));
+    c.vx = c.sx + c.dx;
+    c.vy = c.sy + c.dy;
+    c.x += c.vx * dt;
+    c.y += c.vy * dt;
+    // Gone once out of view with no line to swim in (its mother has left).
+    if (motherOf(i) < 0 && offScreen(c, DUCK_R)) c.active = false;
   };
   const updateDucks = (dt, t) => {
     ducks.forEach((d, i) => {
-      if (!d.active) {
+      if (d.active) (d.chick ? updateChick : updateDuck)(d, i, dt, t);
+      else if (!d.chick) {
         d.wait -= dt;
         // (Ducks swim even with reduced motion: they're slow and gentle.)
         if (d.wait <= 0) spawnDuck(d, i);
-      } else {
-        d.age += dt;
-        // Waves push the duck: the water's push (wave energy flux around it,
-        // from the GPU) drives a drift velocity that water drag slows down.
-        // A pushed duck turns to go with it, the more the harder it's
-        // pushed, and paddles a little faster for a moment, as if startled.
-        const w = duckPush[i];
-        let ax = w.x * DUCK_WAVE_PUSH;
-        let ay = w.y * DUCK_WAVE_PUSH;
-        const al = Math.hypot(ax, ay);
-        if (al > 160) {
-          ax *= 160 / al;
-          ay *= 160 / al;
-        }
-        const drag = Math.exp(-dt * 2.2);
-        d.dx = (d.dx + ax * dt) * drag;
-        d.dy = (d.dy + ay * dt) * drag;
-        const drift = Math.hypot(d.dx, d.dy);
-        if (drift > 2) {
-          const want = Math.atan2(d.dy, d.dx);
-          const diff = Math.atan2(Math.sin(want - d.base), Math.cos(want - d.base));
-          d.base += diff * Math.min(1, drift / 30) * (1 - Math.exp(-dt * 1.6));
-        }
-        d.startle = Math.max(d.startle * Math.exp(-dt * 0.8), Math.min(1, drift / 40));
-        // Weave: a slow meander plus a quicker side-to-side.
-        const sway = 0.7 * Math.sin(t * 0.45 + d.phase) + 0.35 * Math.sin(t * 1.15 + d.phase * 1.7);
-        const before = d.heading;
-        d.heading += (d.base + sway - d.heading) * (1 - Math.exp(-dt * 2));
-        // Body bend follows the turn rate (curvature of the path, exaggerated).
-        const turn = (d.heading - before) / Math.max(dt, 1e-3);
-        d.bend += (Math.max(-0.012, Math.min(0.012, (turn / d.speed) * 0.9)) - d.bend) * (1 - Math.exp(-dt * 5));
-        // Paddle-and-glide rhythm.
-        const v = d.speed * (0.8 + 0.25 * Math.sin(t * 2.2 + d.phase)) * (1 + 0.6 * d.startle);
-        d.vx = Math.cos(d.heading) * v + d.dx;
-        d.vy = Math.sin(d.heading) * v + d.dy;
-        d.x += d.vx * dt;
-        d.y += d.vy * dt;
-        const m = DUCK_R * 2;
-        const vx = d.x - scrollX;
-        const vy = d.y - scrollY;
-        if (d.age > 2 && (vx < -m || vy < -m || vx > innerWidth + m || vy > innerHeight + m)) {
-          d.active = false;
-          d.wait = between(3, 10);
-        }
       }
+    });
+    ducks.forEach((d, i) => {
       if (d.active) {
         // (The shaders take ducks in viewport coordinates.)
         duckData[i].set(d.x - scrollX, d.y - scrollY, Math.cos(d.heading), Math.sin(d.heading));
-        if (duckTest && i === 0) window.__duck = { x: d.x - scrollX, y: d.y - scrollY, h: d.heading, dx: d.dx, dy: d.dy };
         duckVel[i].set(d.vx, d.vy, d.bend, 0);
       } else {
         duckData[i].set(-1e5, -1e5, 1, 0);
         duckVel[i].set(0, 0, 0, 0);
       }
     });
+    if (duckTest) {
+      const d = ducks[0];
+      window.__duck = { x: d.x - scrollX, y: d.y - scrollY, h: d.heading, dx: d.dx, dy: d.dy };
+      window.__ducks = ducks.map((c) => c.active && { x: c.x - scrollX, y: c.y - scrollY, leader: c.leader, chick: c.chick });
+    }
   };
 
   // ------------------------------------------------------------------- loop

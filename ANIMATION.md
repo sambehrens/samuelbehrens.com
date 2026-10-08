@@ -21,9 +21,10 @@ shaders. This doc is for future agents picking the work up.
 ## URL params / dev menu
 
 `?nofx` disables the effect, `?debug` overlays DOM text, `?ducktest` spawns a
-duck immediately at 70%/45% of the viewport heading right
+duck (always with a brood of ducklings) immediately at 70%/45% of the viewport heading right
 (`?ducktest=x,y,heading` to aim it, fractions of the view / radians; it
-also puts the duck's viewport position in `window.__duck`; e.g.
+also puts the duck's viewport position in `window.__duck` and every duck
+slot's position / leader in `window.__ducks`; e.g.
 `?ducktest=0.5,0.38,0` sends it through a pad colony), `?gputime` turns
 on GPU timestamp queries and puts `{c, r}` (compute / render ms, every 30
 frames) in `window.__gpu` (splits compute into three submissions). The
@@ -57,7 +58,7 @@ Node storage buffers (`instancedArray`, size `MAX_NODES = 2^17`):
   for pads, how far grown)
 - `lookBuf` what the cell looks like, resolved once per node per frame:
   x surface code (0 water, 1.x pad (fraction = wave lift, 0.45 level),
-  2..2.9 glyph (+hover darkening), 3 orange bar, 4.x duck body, 5.x duck bill (fraction = wave lift, like pads)),
+  2..2.9 glyph (+hover darkening), 3 orange bar, 4.x duck body, 5.x duck bill, 6.x duckling body (fraction = wave lift, like pads)),
   y spacing (**pad radius** for pads), z rnd (glyph / bar cells:
   `floor(rnd·32) + wave lift`, since their x fraction is taken), w tone
   (glyph) / tint
@@ -73,7 +74,8 @@ slow h, slow h_prev), `waveView` (vec2: both heights, written by every step),
 re-anchors), `facetBuf` (per mosaic cell: centre, crest, trough), `facetMax`
 (3×3 max of crest/trough, so calm pixels skip after one read).
 
-Uniform arrays: `uDucks` (viewport pos + heading), `uDuckVel` (vel + body
+Uniform arrays (one entry per **duck slot**: `MAX_DUCKS` big ducks, then
+`MAX_DUCKLINGS` ducklings): `uDucks` (viewport pos + heading), `uDuckVel` (vel + body
 bend in z), `uDrops` (click splashes: document pos, start time, strength).
 
 ## Per-frame pipeline (`renderer.setAnimationLoop`)
@@ -125,7 +127,7 @@ Then a full-screen `QuadMesh` with `shade()`:
   then composite.
 
 Then the **lily pad pass** (`padShader`) draws all "leaves", i.e. lily pads
-and duck cells (`isLeafCode`: surface 1, 4, 5): an instanced quad per node
+and duck cells (`isLeafCode`: surface 1, 4, 5, 6): an instanced quad per node
 (count = nodeCount; others emit an off-screen vertex), drawn over the main pass
 (`renderer.autoClear = false`). **Why separate:** inside the full-screen
 shader, the pad + flower code slowed *every* pixel (register pressure) by
@@ -258,6 +260,40 @@ counts, because the slow layer is mostly the duck's own paddling.
 `?ducktest&duckwave` exposes the readback as `window.__duckWave`; `__duck`
 also has heading and drift. (A first try at 3000 shoved the duck ~400px.)
 
+### Ducklings
+
+About half the ducks (`BROOD_CHANCE=0.5`) bring a brood of 3–4 ducklings.
+They use the duck slots after the big ducks' (`MAX_DUCKLINGS=8` shared slots,
+`isChickSlot(i)`), so every GPU path (cells, shove ellipses, paddling, wake,
+wave readback) handles them like ducks with per-slot sizes (`slotCells`,
+`slotScale`, `slotExtent`; loops over slots are unrolled so sizes are
+compile-time). A duckling is 3 cells at `CHICK=0.46` scale: a round body, a
+big head and a little bill (`chickCells`), in the palette's `duckling`
+yellow (surface code 6) with the accent bill. Splitting it into the duck's 7
+cells read as a scatter of petals at this size; cream tinted toward the
+accent read as tan, not yellow. Heads bob quicker, feet paddle at 1.6× the
+duck's rate into the slow layer (`DUCKLING_PADDLE`), so each leaves a tiny
+V wake.
+
+CPU (`updateChick`): each duckling has a `leader` (a duck slot). It follows
+a rope point `gapBehind(leader, i)` from the leader (on the line toward it,
+pulled round behind the leader's heading), plus the leader's velocity, with
+inertia and paddling spurts; heading follows its swimming velocity. Waves
+push ducklings harder than ducks (`DUCKLING_WAVE_PUSH=1.5`× gain, more drag).
+A duckling more than `DUCKLING_LOST=70`px from its spot, or drifting faster
+than `DUCKLING_SCATTER=45`px/s, **loses its line**: the one behind it moves
+up (`loseLine`). After a 0.35s daze it hurries (`DUCKLING_RUSH=4.2`×
+`DUCK_SPEED`) to the **nearest duck that's in a line** (`motherOf` ≥ 0) and
+joins the end of that line (`tailOf`) once within `DUCKLING_JOIN=24`px, so
+it can end up with another mother. Ducklings keep out of other ducks' way
+(a simple CPU repulsion). A mother leaves only once she and her whole brood
+are out of view; ducklings with no line left (`motherOf` < 0) swim on and
+disappear once out of view. Tested: a click splash beside a brood scatters
+all of it and it regroups in ~3–4s; a quick stroke across the tail knocks
+out just the last duckling or two.
+
+### Duck cells
+
 Each cell springs to its spot in the duck's frame (head and bill bob; whole
 body bends by rotating each cell by `x × bend`, bend from turn rate) with the
 duck's velocity fed forward, so it holds shape but can be knocked apart.
@@ -352,7 +388,9 @@ blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
 ## User preferences learned
 
 Asked for: a large ripple/wave when clicking (see Click splashes); waves
-and ripples affecting the letters (see Letter styling).
+and ripples affecting the letters (see Letter styling); ducklings in a line
+behind about half the ducks, separable, swimming back to the nearest duck
+(see Ducklings).
 Liked: blobby rounded ripple cells, V wakes (esp. duck wakes and fast cursor
 strokes), clustered pads, Voronoi-cell pads (some bigger, a little Voronoi
 irregularity is fine; veins, lit rim), flowers, ducks parting pads, ducks drawn in the pad style, letters with the same lit
