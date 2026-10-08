@@ -22,7 +22,12 @@
   </head>
   <body>
     <!-- The homepage's pond on its own: no words or links (no [data-fx]
-         elements), so the water, lily pads and animals fill the window. -->
+         elements), so the water, lily pads and animals fill the window.
+         Just a small fps meter in the corner; clicking it hides it. -->
     <canvas id="fx" aria-hidden="true"></canvas>
+
+    <button class="dev-menu dev-mini" type="button" title="Hide">
+      <span class="dev-fps"><span id="dev-fps">–</span> fps</span>
+    </button>
   </body>
 </html>

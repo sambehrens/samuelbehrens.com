@@ -234,6 +234,28 @@ html.fx-on ::selection {
   color: var(--ink);
 }
 
+/* /pond: just a small fps meter; clicking it hides it. A faint frosted
+   tint of the water with pale text, so it sits in the pond. */
+.dev-mini {
+  right: 0.25rem;
+  bottom: 0.25rem;
+  padding: 0.2rem 0.45rem;
+  border: 0;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: none;
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  font: inherit;
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
+.dev-mini .dev-fps {
+  min-width: 0;
+  color: rgba(239, 233, 218, 0.6);
+}
+
 /* ?debug overlays the DOM text so glyph alignment can be checked. */
 html.fx-debug.fx-on .page,
 html.fx-debug.fx-on .nav a {

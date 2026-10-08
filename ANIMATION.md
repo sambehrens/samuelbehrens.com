@@ -11,11 +11,14 @@ shaders. This doc is for future agents picking the work up.
 - `index.html` — real DOM content (header, nav, links), a `<canvas id="fx">`,
   the dev menu (`.dev-menu`), and an importmap loading **three@0.186.1** from
   jsDelivr (`three/webgpu`, `three/tsl`). No build step (GitHub Pages).
-- `pond/index.html` (served at `/pond`) — the same animation with no words,
-  links or dev menu: just the canvas, so the pond fills the window. It loads
-  `../css/home.css` and `../js/voronoi.js` unchanged; with no `[data-fx]`
-  elements `layout()` only places water and pads, and `setupDevMenu()` returns
-  early when the page has no `.dev-menu`. Same URL params work there.
+- `pond/index.html` (served at `/pond`) — the same animation with no words
+  or links, so the pond fills the window, plus a small, faint fps meter in the
+  bottom right (`.dev-menu.dev-mini`, a button: pale cream text on a light
+  frosted tint, no border, so it blends into the water; clicking it removes it until
+  reload). It loads `../css/home.css` and `../js/voronoi.js` unchanged; with
+  no `[data-fx]` elements `layout()` only places water and pads, and
+  `setupDevMenu()` only starts the fps meter (`startFpsMeter`) for a
+  `.dev-mini` menu. Same URL params work there.
 - `css/home.css` — page styles. When the effect runs, `html.fx-on` makes DOM
   text transparent (it stays for layout, links, selection, a11y) and hides the
   CSS underline bars. `html.fx-debug` shows DOM text in red for alignment.

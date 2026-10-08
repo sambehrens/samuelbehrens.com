@@ -3372,13 +3372,20 @@ function mulberry32(a) {
 }
 
 // Bottom-right dev menu: fps meter, debug overlay toggle, effects on/off link.
-// (Pages without one, like /pond, skip it.)
+// (/pond's menu is just a small fps meter that hides when clicked.)
 function setupDevMenu() {
-  if (!document.querySelector(".dev-menu")) return;
+  const menu = document.querySelector(".dev-menu");
+  if (!menu) return;
   const fpsEl = document.getElementById("dev-fps");
   const debugEl = document.getElementById("dev-debug");
   const fxEl = document.getElementById("dev-fx");
   const fxDisabled = params.has("nofx");
+
+  if (menu.classList.contains("dev-mini")) {
+    menu.addEventListener("click", () => menu.remove());
+    startFpsMeter(fpsEl);
+    return;
+  }
 
   fxEl.href = fxDisabled ? location.pathname : "?nofx";
   fxEl.textContent = fxDisabled ? "Turn effects on" : "Turn effects off";
@@ -3391,10 +3398,15 @@ function setupDevMenu() {
     history.replaceState(null, "", debugEl.checked ? "?debug" : location.pathname);
   });
 
-  // Counts animation frames, which is the effect's frame rate when it's on.
+  startFpsMeter(fpsEl);
+}
+
+// Counts animation frames, which is the effect's frame rate when it's on.
+function startFpsMeter(fpsEl) {
   let frames = 0;
   let since = performance.now();
   const tick = (now) => {
+    if (!fpsEl.isConnected) return; // (hidden for good)
     frames++;
     if (now - since >= 500) {
       fpsEl.textContent = Math.round((frames * 1000) / (now - since));
