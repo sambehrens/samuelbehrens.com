@@ -239,9 +239,35 @@ async function main() {
     maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
     maxBufferSize: adapter.limits.maxBufferSize,
   };
-  const renderer = new THREE.WebGPURenderer({ canvas, antialias: false, trackTimestamp: gpuTime, requiredLimits });
+  const renderer = new THREE.WebGPURenderer({ canvas, antialias: false, depth: false, trackTimestamp: gpuTime, requiredLimits });
   await renderer.init();
   if (!renderer.backend.isWebGPUBackend) return;
+
+  // GPU-only storage buffers (see gpuArray) are created here at full size,
+  // empty (WebGPU zero-fills them), instead of from three's CPU array.
+  const device = renderer.backend.device;
+  const createBuffer = device.createBuffer.bind(device);
+  device.createBuffer = (desc) => {
+    const gpuOnly = /^gpu-only:(\d+)$/.exec(desc.label || "");
+    if (!gpuOnly) return createBuffer(desc);
+    const buffer = createBuffer({ label: desc.label, size: +gpuOnly[1], usage: desc.usage });
+    // (three fills its 1-item array in through a mapping; nothing to upload.)
+    const scratch = new ArrayBuffer(desc.size);
+    buffer.getMappedRange = () => scratch;
+    buffer.unmap = () => {};
+    return buffer;
+  };
+  // A storage buffer only the GPU writes. three keeps a CPU copy of every
+  // storage buffer and uploads it mapped-at-creation, and Chrome keeps that
+  // mapping's shared memory for the buffer's whole life, in both the page and
+  // the GPU process: ~4 copies of each buffer, which made the tab take ~750MB.
+  // So three gets a 1-item array, and the real buffer is made above. (WGSL
+  // storage arrays are runtime-sized, so the shaders see all of it.)
+  const gpuArray = (count, type) => {
+    const node = instancedArray(1, type);
+    node.value.name = `gpu-only:${count * node.value.array.byteLength}`;
+    return node;
+  };
 
   // (The full-screen pass covers everything; the lily pad pass draws over it.)
   renderer.autoClear = false;
@@ -345,20 +371,20 @@ async function main() {
   const posBuf = instancedArray(MAX_NODES, "vec4");
   const homeBuf = instancedArray(MAX_NODES, "vec4");
   const attrBuf = instancedArray(MAX_NODES, "vec4");
-  const lifeBuf = instancedArray(MAX_NODES, "vec4");
-  const siteBuf = instancedArray(MAX_NODES, "vec4");
+  const lifeBuf = gpuArray(MAX_NODES, "vec4");
+  const siteBuf = gpuArray(MAX_NODES, "vec4");
   // look (GPU-written): everything the pixel shader needs about a node, so it
   // reads one vec4 instead of home/attr/life/group.
   //   x surface: 0 water, 1 lily pad, 2..2.9 glyph (fraction = hover darkening), 3 orange bar, 4 duck body, 5 duck bill, 6 ripple
   //   y spacing, z random, w water tint (water/pad) | tone (glyph) | strength (ripple)
-  const lookBuf = instancedArray(MAX_NODES, "vec4");
+  const lookBuf = gpuArray(MAX_NODES, "vec4");
   // group: [2g] = (hover, darkens-on-hover, restTone, hoverTone), [2g+1] = bar (restLo, restHi, hoverLo, hoverHi)
   const groupBuf = instancedArray(MAX_GROUPS * 2, "vec4");
 
   const fieldCap =
     Math.ceil(Math.max(screen.width, innerWidth, 2560) / FIELD_CELL + 2) *
     Math.ceil(Math.max(screen.height, innerHeight, 1600) / FIELD_CELL + 2);
-  const fieldBuf = instancedArray(fieldCap, "vec4"); // x energy, yz flow velocity, w water height
+  const fieldBuf = gpuArray(fieldCap, "vec4"); // x energy, yz flow velocity, w water height
 
   const ro = (node, type, count) => storage(node.value, type, count).toReadOnly();
   const siteRO = ro(siteBuf, "vec4", MAX_NODES);
@@ -394,14 +420,14 @@ async function main() {
   const waveCap =
     Math.ceil(Math.max(screen.width, innerWidth, 2560) / WAVE_CELL + 12) *
     Math.ceil(Math.max(screen.height, innerHeight, 1600) / WAVE_CELL + 12);
-  const waveA = instancedArray(waveCap, "vec4");
-  const waveB = instancedArray(waveCap, "vec4");
+  const waveA = gpuArray(waveCap, "vec4");
+  const waveB = gpuArray(waveCap, "vec4");
   // Just the two heights (written by every step, whichever buffer it
   // lands in), for everything that only looks at the water.
-  const waveView = instancedArray(waveCap, "vec2");
+  const waveView = gpuArray(waveCap, "vec2");
   // Lily pad colonies soak waves up: extra damping per cell. Pads never move,
   // so this is only recomputed when the grid is re-anchored (scroll/resize).
-  const wavePads = instancedArray(waveCap, "float");
+  const wavePads = gpuArray(waveCap, "float");
   const wavePadPass = Fn(() => {
     const idx = int(instanceIndex);
     const c = uWaveOrigin.add(vec2(float(idx.mod(uWW)), float(idx.div(uWW))).add(0.5).mul(WAVE_CELL));
@@ -602,8 +628,8 @@ async function main() {
   const facetCap =
     (Math.ceil(Math.max(screen.width, innerWidth, 2560) / FACET) + 6) *
     (Math.ceil(Math.max(screen.height, innerHeight, 1600) / FACET) + 6);
-  const facetBuf = instancedArray(facetCap, "vec4"); // xy centre (document px), z crest, w trough
-  const facetMax = instancedArray(facetCap, "float"); // brightest in its 3x3 (0 = calm, skip)
+  const facetBuf = gpuArray(facetCap, "vec4"); // xy centre (document px), z crest, w trough
+  const facetMax = gpuArray(facetCap, "float"); // brightest in its 3x3 (0 = calm, skip)
   const facetUpdate = Fn(() => {
     const idx = int(instanceIndex);
     const cx = uFacetX0.add(idx.mod(uFacetW));
@@ -904,16 +930,16 @@ async function main() {
   // edge row and column).
   const buildPixelStage = (capacity) => {
     const blockCap = Math.ceil(capacity / 4) + 8192;
-    const jfaA = instancedArray(blockCap, "int");
-    const jfaB = instancedArray(blockCap, "int");
-    const slotCount = instancedArray(capacity, "uint").toAtomic();
-    const slots = instancedArray(capacity * SLOTS, "int");
+    const jfaA = gpuArray(blockCap, "int");
+    const jfaB = gpuArray(blockCap, "int");
+    const slotCount = gpuArray(capacity, "uint").toAtomic();
+    const slots = gpuArray(capacity * SLOTS, "int");
     // Per 2x2 block, the lily pad nearest its centre by power distance among
     // those whose disc covers it, packed as (quantized distance << 17 | id)
     // so atomicMin picks it (0xffffffff = none). The pixel shader adds it as
     // a candidate, so a pad is never missed (the block lists can miss a heavy
     // pad whose centre is far off).
-    const padBlock = instancedArray(blockCap, "uint").toAtomic();
+    const padBlock = gpuArray(blockCap, "uint").toAtomic();
 
     const clear = Fn(() => {
       If(int(instanceIndex).lessThan(uNW.mul(uNH)), () => {
@@ -1003,7 +1029,7 @@ async function main() {
     // wider rings so neighbours a corner-radius away are found too. The
     // pixel shader then only has to rank these exactly.
     const jfa = src;
-    const nbr = instancedArray(blockCap, "ivec4");
+    const nbr = gpuArray(blockCap, "ivec4");
     const neighbours = Fn(() => {
       const idx = int(instanceIndex);
       const bx = idx.mod(uNW).mul(2); // the block's top-left cell
@@ -1078,7 +1104,7 @@ async function main() {
     // Per pad node, 5 vec4s: its 6 nearest edge lines as (normal x, normal y,
     // offset) triples packed back to back (sorted nearest first; farther ones
     // never form a visible edge), then how much room its flower has.
-    const padData = instancedArray(MAX_NODES * 5, "vec4");
+    const padData = gpuArray(MAX_NODES * 5, "vec4");
     // (Half the pads per frame, alternating: pads drift slowly, so edge lines
     // one frame old are fine, and this pass isn't cheap.)
     const padEdgePass = Fn(() => {

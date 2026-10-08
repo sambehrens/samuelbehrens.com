@@ -381,6 +381,22 @@ blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
   capped at what the device allows, and turns the effect off (plain page)
   if the view itself won't fit. The jump-flood, neighbour-list and pad-block
   buffers are per 2×2 block (`blockCap`, a quarter of the pixels).
+- **Memory**: three.js keeps a CPU copy of every storage buffer and uploads
+  it mapped-at-creation, and Chrome keeps that mapping's shared memory for
+  the buffer's whole life, in the page *and* the GPU process (measured with a
+  bare 200MB buffer: empty +192MB GPU / +0 page; mapped-at-creation +383MB
+  GPU / +191MB page). With ~92MB of buffers that made the tab ~800MB
+  (`footprint -p <pid>` on the GPU and renderer processes). So buffers only
+  the GPU writes are made with `gpuArray()`: three gets a 1-item array named
+  `gpu-only:<bytes>`, and a hook on `device.createBuffer` makes the real,
+  empty (zero-filled) buffer at full size (WGSL storage arrays are
+  runtime-sized, so shaders see all of it). Only CPU-written buffers (pos,
+  home, attr, group, duckWave) use `instancedArray`. The renderer is also
+  made with `depth: false` (nothing uses depth; a screen-size depth24
+  texture). Result on a Retina MacBook: page 297→133MB, GPU process
+  501→~400MB. What's left in the GPU process is mostly the canvas's
+  swap-chain surfaces (~75MB), the buffers themselves (slot grid 32MB,
+  padData 10.5MB, ...) and pipelines.
 - If the owner has the site open in their own Chrome, it shares the GPU and
   headful benchmarks read low (~90fps) for every version: compare against a
   backup in the same session before concluding something got slower.
