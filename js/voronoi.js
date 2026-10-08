@@ -415,13 +415,13 @@ async function main() {
   // Colors are authored and blended in sRGB so the canvas matches the CSS.
   renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 
-  // (Only layout() needs the fonts: the shaders compile while they load.)
-  const fontsReady = Promise.all([
-    document.fonts.load('400 64px "Fjalla One"'),
-    document.fonts.load('700 16px "Lato"'),
-  ])
-    .catch(() => {})
-    .then(() => document.fonts.ready);
+  // (Only layout() needs the fonts: the shaders compile while they load.
+  // /pond has no words, so it doesn't wait for them.)
+  const fontsReady = document.querySelector("[data-fx]")
+    ? Promise.all([document.fonts.load('400 64px "Fjalla One"'), document.fonts.load('700 16px "Lato"')])
+        .catch(() => {})
+        .then(() => document.fonts.ready)
+    : Promise.resolve();
 
   // ---------------------------------------------------------------- uniforms
 

@@ -22,6 +22,10 @@ shaders. This doc is for future agents picking the work up.
   no `[data-fx]` elements `layout()` only places water and pads, and
   `setupDevMenu()` only starts the fps meter (`startFpsMeter`) for a
   `.dev-mini` menu. Same URL params work there.
+- `fonts/` — self-hosted Fjalla One 400 and Lato 300/400/700 (latin
+  subset woff2 from Google Fonts, OFL licenses alongside), declared at the
+  top of `css/home.css`. `index.html` preloads the two that `layout()` waits
+  for (Fjalla One 400, Lato 700).
 - `css/home.css` — page styles. When the effect runs, `html.fx-on` makes DOM
   text transparent (it stays for layout, links, selection, a11y) and hides the
   CSS underline bars. `html.fx-debug` shows DOM text in red for alignment.
@@ -659,7 +663,11 @@ first frame lands ~530ms after navigation with a warm cache (was ~590) and
   the long pole. Left to the first frame, this was all serial: ~250ms of
   CPU in frame 0, then a ~200ms gap before frame 1.
 - **`layout()`** ~70ms the first time (~26ms after: JIT, first canvas
-  readback, reflow), and it waits for the fonts.
+  readback, reflow), and it waits for the fonts (self-hosted and preloaded,
+  so they arrive with the modules; they used to come from Google Fonts,
+  whose render-blocking stylesheet also held up the module script, and on a
+  first visit were seen arriving at ~430ms). /pond has no `[data-fx]` words
+  and doesn't wait for fonts at all.
 
 So `main()` overlaps them: after the first `resize()` (which builds the
 pixel stage), `compileShaders()` builds each compute pass in its own task
@@ -681,9 +689,7 @@ starts once every pipeline is ready. Frame 0 then takes ~1ms.
   out still works; it just builds on frame 0).
 - Now the CPU (~340ms of building + layout) and the GPU (`nodeUpdate`)
   finish at about the same time. Going faster needs a smaller `nodeUpdate`
-  shader or less TSL. On a first visit the Google Fonts can also arrive
-  late (~430ms seen in a fresh profile) and put `layout()` on the critical
-  path; self-hosting/preloading the fonts would help there.
+  shader or less TSL.
 
 ## Performance notes (target: 120fps on a Retina MacBook)
 
