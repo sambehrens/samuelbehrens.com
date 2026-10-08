@@ -4,13 +4,6 @@
     <title>Sam Behrens</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link href="" rel="stylesheet" />
-    <link
-      href="https://fonts.googleapis.com/css?family=Fjalla+One|Lato"
-      rel="stylesheet"
-    />
-    <link rel="stylesheet" href="css/style.css" />
-    <link rel="stylesheet" href="css/index.css" />
     <meta name="name" content="Sam Behrens" />
     <meta
       name="description"
@@ -25,48 +18,79 @@
       content="My personal website where you can find the projects that I am working on and my resume."
     />
     <meta name="twitter:title" content="Sam Behrens" />
-    <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+    <meta name="color-scheme" content="light dark" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fjalla+One&family=Lato:wght@300;400;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="css/home.css" />
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.webgpu.js",
+          "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.tsl.js"
+        }
+      }
+    </script>
+    <script type="module" src="js/voronoi.js"></script>
   </head>
   <body>
-    <div id="wrapper">
-      <div id="header">
-        <a id="titleContainer" href="#"
-          ><h1 id="wordOne">Sam</h1>
-          <h2 id="wordTwo">Behrens</h2>
+    <!-- The GPU renders every word below out of Voronoi cells. The DOM text
+         stays in place (transparent) so links, selection and screen readers
+         keep working, and it is what you see if WebGPU is unavailable. -->
+    <canvas id="fx" aria-hidden="true"></canvas>
+
+    <aside class="dev-menu" aria-label="Developer tools">
+      <span class="dev-fps"><span id="dev-fps">–</span> fps</span>
+      <label><input type="checkbox" id="dev-debug" /> Debug overlay</label>
+      <a id="dev-fx" href="?nofx">Turn effects off</a>
+    </aside>
+
+    <div class="page">
+      <header class="header">
+        <a class="title" href="#">
+          <h1 class="word-one" data-fx="title">Sam</h1>
+          <h2 class="word-two" data-fx="title">Behrens</h2>
         </a>
-        <div id="navContainer">
-          <a id="current" href="#">Home</a>
-          <a href="resume.html">Resume</a>
-          <!-- <a href="hobbies.html">Hobbies</a> -->
-          <a href="https://www.github.com/sambehrens/" target="_blank"
+        <nav class="nav">
+          <a class="current" href="#" data-fx="current">Home</a>
+          <a href="resume.html" data-fx="nav">Resume</a>
+          <a href="https://www.github.com/sambehrens/" target="_blank" data-fx="nav"
             >↗ GitHub</a
           >
           <a
             href="https://www.linkedin.com/in/samuel-behrens-88ab57132/"
             target="_blank"
+            data-fx="nav"
             >↗ LinkedIn</a
           >
-        </div>
-      </div>
+        </nav>
+      </header>
 
-      <div class="home-page-content">
+      <main class="content">
         <div class="main-links">
-          <a href="https://www.typeracelive.com" target="_blank"
-            >TypeRaceLive.com</a
+          <a href="https://www.typeracelive.com" target="_blank" data-fx="link">TypeRaceLive.com</a>
+          <a href="https://www.thewordmatrix.app" target="_blank" data-fx="link">TheWordMatrix.app</a>
+          <a href="http://sambehrens.github.io/recipes/" target="_blank" data-fx="link">Recipes</a>
+          <a href="https://www.giftgo.io" target="_blank" data-fx="link">GiftGo.io</a>
+          <a href="https://sambehrens.github.io/download-maps-guide/" target="_blank" data-fx="link"
+            >Download Google Maps Guide</a
           >
-          <a href="https://www.thewordmatrix.app" target="_blank"
-            >TheWordMatrix.app</a
+          <a href="https://apps.apple.com/us/app/color-climber/id1086523196" target="_blank" data-fx="link"
+            >Color Climber (removed from app store)</a
           >
-          <a href="http://sambehrens.github.io/recipes/" target="_blank">Recipes</a>
-          <a href="https://www.giftgo.io" target="_blank">GiftGo.io</a>
-          <a href="https://sambehrens.github.io/download-maps-guide/" target="_blank">Download Google Maps Guide</a>
-          <a disabled="true" href="https://apps.apple.com/us/app/color-climber/id1086523196" target="_blank">Color Climber (removed from app store)</a>
-          <a disabled="true" href="https://apps.apple.com/us/app/bottle-cap-stickers/id1173394631" target="_blank">Bottle Cap Stickers! (removed from app store)</a>
-          <a href="http://sambehrens.github.io/walls/" target="_blank">Walls</a>
-          <a href="http://sambehrens.github.io/maze/" target="_blank">Maze</a>
-          <a href="http://sambehrens.github.io/map/" target="_blank">Map</a>
+          <a href="https://apps.apple.com/us/app/bottle-cap-stickers/id1173394631" target="_blank" data-fx="link"
+            >Bottle Cap Stickers! (removed from app store)</a
+          >
+          <a href="http://sambehrens.github.io/walls/" target="_blank" data-fx="link">Walls</a>
+          <a href="http://sambehrens.github.io/maze/" target="_blank" data-fx="link">Maze</a>
+          <a href="http://sambehrens.github.io/map/" target="_blank" data-fx="link">Map</a>
         </div>
-      </div>
+      </main>
     </div>
   </body>
 </html>
