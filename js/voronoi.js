@@ -101,6 +101,12 @@ const WAVE_FREQ = [4, 0.9];
 const WAVE_VISC = [25, 8];
 const WAVE_LEVEL = [7.5, 2]; // rad/s, how fast an offset water level bobs back // css px^2/s, kills grid-scale noise // Hz the movers' pushes pulse at (sets the wavelength)
 const CURSOR_PUSH = 7; // wave push of a cursor stroke (scaled by speed)
+// A click (or tap) makes a big splash: a wide push that sends out a few rings.
+const MAX_DROPS = 4; // splashes in flight at once
+const DROP_PUSH = [110, 8]; // fast, slow layer
+const DROP_SIGMA = 16; // css px, width of the splash
+const DROP_FREQ = 3; // Hz the fast push swings at (a train of a few rings)
+const DROP_TIME = 0.8; // s, how long the fast push lasts (the slow one: a quarter)
 const DUCK_PRESS = 0;
 const PAD_SWAY = 60; // how far pads sway with passing waves (px per unit slope) // how deep a duck's body dents the water
 const DUCK_PADDLE = 6; // how hard its feet paddle
@@ -242,6 +248,9 @@ async function main() {
   const uCurB = uniform(new THREE.Vector2(-1e5, -1e5));
   const uCurPush = uniform(new THREE.Vector2()); // fast layer, slow layer
   const uCurSteady = uniform(0);
+  // Click splashes: document xy, start time (uTime), strength (0 = unused).
+  const dropData = Array.from({ length: MAX_DROPS }, () => new THREE.Vector4(-1e5, -1e5, -1e5, 0));
+  const uDrops = uniformArray(dropData, "vec4");
   // Ripple mosaic: a grid of FACET-px cells (document-anchored) over the view.
   const uFacetX0 = uniform(0, "int"); // document cell of the grid's corner
   const uFacetY0 = uniform(0, "int");
@@ -391,6 +400,23 @@ async function main() {
       // which leaves a clean V wake (uCurSteady blends between the two).
       const pulse = mix(vec2(sin(uTime.mul(Math.PI * 2 * WAVE_FREQ[0])), sin(uTime.mul(Math.PI * 2 * WAVE_FREQ[1]))), vec2(1), uCurSteady);
       const force = uCurPush.mul(pulse).mul(vec2(hat(sig[0]), hat(sig[1]))).mul(vec2(stiff(sig[0]).x, stiff(sig[1]).y)).toVar();
+      // Click splashes: a wide push (the same zero-mean profile) that sends a
+      // train of big rings out across the pond, with slow rings lingering
+      // where it landed.
+      const dropForce = vec2(...WAVE_SPEED.map((cs, l) => (cs * cs * DROP_PUSH[l]) / DROP_SIGMA ** 2));
+      for (let i = 0; i < MAX_DROPS; i++) {
+        const drop = uDrops.element(i);
+        // Fast layer: a swing that dies away (a big lead crest, then smaller
+        // rings); slow layer: one soft push.
+        const age = uTime.sub(drop.z).toVar();
+        const fade = float(1).sub(clamp(age.div(DROP_TIME), 0, 1));
+        const swing = sin(age.mul(Math.PI * 2 * DROP_FREQ)).mul(fade.mul(fade));
+        const soft = sin(clamp(age.div(DROP_TIME / 4), 0, 1).mul(Math.PI));
+        const dd = c.sub(drop.xy);
+        const q = dot(dd, dd).div(2 * DROP_SIGMA * DROP_SIGMA);
+        const shape = float(1).sub(q).mul(exp(q.negate())).mul(drop.w);
+        force.addAssign(dropForce.mul(vec2(swing, soft)).mul(shape));
+      }
       // Ducks: the body presses a dent that travels with it (a moving dent
       // makes a wake), and the paddling feet behind it pulse.
       for (let i = 0; i < MAX_DUCKS; i++) {
@@ -1778,6 +1804,13 @@ async function main() {
   document.addEventListener("pointerleave", deactivate);
   addEventListener("blur", deactivate);
   addEventListener("pointerup", (e) => e.pointerType === "touch" && deactivate());
+  // A click or tap splashes the water (the oldest splash slot is reused).
+  let nextDrop = 0;
+  addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || e.target.closest?.(".dev-menu")) return;
+    dropData[nextDrop].set(e.clientX + scrollX, e.clientY + scrollY, uTime.value, 1);
+    nextDrop = (nextDrop + 1) % MAX_DROPS;
+  });
 
   // ------------------------------------------------------------------ ducks
 
@@ -1831,7 +1864,8 @@ async function main() {
     ducks.forEach((d, i) => {
       if (!d.active) {
         d.wait -= dt;
-        if (d.wait <= 0 && !reduceMotion.matches) spawnDuck(d, i);
+        // (Ducks swim even with reduced motion: they're slow and gentle.)
+        if (d.wait <= 0) spawnDuck(d, i);
       } else {
         d.age += dt;
         // Waves push the duck: the water's push (wave energy flux around it,

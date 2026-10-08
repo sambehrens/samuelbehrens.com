@@ -71,7 +71,7 @@ re-anchors), `facetBuf` (per mosaic cell: centre, crest, trough), `facetMax`
 (3×3 max of crest/trough, so calm pixels skip after one read).
 
 Uniform arrays: `uDucks` (viewport pos + heading), `uDuckVel` (vel + body
-bend in z).
+bend in z), `uDrops` (click splashes: document pos, start time, strength).
 
 ## Per-frame pipeline (`renderer.setAnimationLoop`)
 
@@ -217,7 +217,10 @@ raw per-frame movement made slow strokes stutter.
 
 CPU steers each duck (enter from an edge of the current view, weave via two
 sines, paddle-and-glide speed, exit, rest 3–10s), in **document coords** so
-scrolling doesn't move them.
+scrolling doesn't move them. Ducks swim even under
+`prefers-reduced-motion` (they're slow and gentle; the owner's phone has iOS
+Reduce Motion on and had no ducks when they were skipped). Reduced motion
+still skips the fly-in intro and calms the ambient drift.
 
 **Drawn like the lily pads** (owner asked for the same style): a duck is 7
 big weighted cells (`duckCells`, radius r, power weight r²): a tail, two
@@ -279,6 +282,17 @@ for fast strokes (`uCurSteady`, speed > c) which leaves a clean V wake (and is
 softened ×0.55 since steady pushes build up more). Strength
 `(speed/500)^0.6 × CURSOR_PUSH (7)`, capped.
 
+**Click splashes**: `pointerdown` (left button or a tap, not on the dev
+menu) writes a splash into `uDrops` (`MAX_DROPS=4` slots, oldest reused).
+In `waveStep` each splash pushes with the same zero-mean hat profile
+(`DROP_SIGMA=16px`): the fast layer with a swing at `DROP_FREQ=3`Hz that
+dies away over `DROP_TIME=0.8`s (fade²), so a big lead ring is followed by a
+couple of smaller ones; the slow layer with one soft push (first quarter of
+that), which leaves lazy rings lingering where it landed. `DROP_PUSH=[110,
+8]`. The rings cross a 1280px view in ~3s, are soaked up by pad colonies,
+and push ducks (wave flux) like any other wave. A single half-sine push gave
+one thin, faint ring; 60 read too weak for a "large" wave. No fps cost.
+
 **Mosaic** (`facetUpdate` / `facetSpread` / shade): the water is a jittered
 grid Voronoi of `FACET=9px` cells, fixed to the page and invisible while calm.
 Per mosaic cell (compute, ~16k cells): centre (+ sway down the slope, capped
@@ -319,6 +333,7 @@ blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
 
 ## User preferences learned
 
+Asked for: a large ripple/wave when clicking (see Click splashes).
 Liked: blobby rounded ripple cells, V wakes (esp. duck wakes and fast cursor
 strokes), clustered pads, Voronoi-cell pads (some bigger, a little Voronoi
 irregularity is fine; veins, lit rim), flowers, ducks parting pads, ducks drawn in the pad style, letters with the same lit
