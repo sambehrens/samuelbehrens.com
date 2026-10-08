@@ -25,7 +25,11 @@ duck (always with a brood of ducklings) immediately at 70%/45% of the viewport h
 (`?ducktest=x,y,heading` to aim it, fractions of the view / radians; it
 also puts the duck's viewport position in `window.__duck` and every duck
 slot's position / leader in `window.__ducks`; e.g.
-`?ducktest=0.5,0.38,0` sends it through a pad colony), `?gputime` turns
+`?ducktest=0.5,0.38,0` sends it through a pad colony), `?raccoontest`
+sends a raccoon in at 25%/50% heading right after 1.5s
+(`?raccoontest=x,y,heading`; `?ducktest&raccoontest=0.42,0.5,0` starts it
+just behind the test duck's brood, which makes a hunt within seconds; each
+`__ducks` entry then also has coon, mode, size, eaten, meals), `?gputime` turns
 on GPU timestamp queries and puts `{c, r}` (compute / render ms, every 30
 frames) in `window.__gpu` (splits compute into three submissions). The
 bottom-right dev menu (`setupDevMenu()`) has an fps meter, debug toggle,
@@ -58,9 +62,10 @@ Node storage buffers (`instancedArray`, size `MAX_NODES = 2^17`):
   for pads, how far grown)
 - `lookBuf` what the cell looks like, resolved once per node per frame:
   x surface code (0 water, 1.x pad (fraction = wave lift, 0.45 level),
-  2..2.9 glyph (+hover darkening), 3 orange bar, 4.x duck body, 5.x duck bill, 6.x duckling body (fraction = wave lift, like pads)),
+  2..2.9 glyph (+hover darkening), 3 orange bar, 4.x duck body, 5.x duck bill, 6.x duckling body, 7.x raccoon fur, 8.x its tail rings / nose, 9.x its muzzle / ears, 10.x its eye patches (fraction = wave lift, like pads)),
   y spacing (**pad radius** for pads), z rnd (glyph / bar cells:
-  `floor(rnd·32) + wave lift`, since their x fraction is taken), w tone
+  `floor(rnd·32) + wave lift`, since their x fraction is taken; a raccoon's
+  eye patch: where its eye is, packed), w tone
   (glyph) / tint
 - `groupBuf` per DOM element: hover, darkens-on-hover, tones, bar ranges
 - `fieldBuf` mouse/duck wake field, 8px cells: x energy, yz flow,
@@ -75,8 +80,13 @@ re-anchors), `facetBuf` (per mosaic cell: centre, crest, trough), `facetMax`
 (3×3 max of crest/trough, so calm pixels skip after one read).
 
 Uniform arrays (one entry per **duck slot**: `MAX_DUCKS` big ducks, then
-`MAX_DUCKLINGS` ducklings): `uDucks` (viewport pos + heading), `uDuckVel` (vel + body
-bend in z), `uDrops` (click splashes: document pos, start time, strength).
+`MAX_RACCOONS` raccoons (from `FIRST_COON`), then `MAX_DUCKLINGS` ducklings
+(from `FIRST_CHICK`)): `uDucks` (viewport pos + heading), `uDuckVel` (vel +
+body bend in z + **size** in w: 1 normal, a swallowed duckling shrinks to 0,
+a raccoon grows as it eats; it scales the slot's cell radii, cell offsets,
+shove ellipse, paddling and wake); `uDuckList` + `uDuckCount` (the slots of
+the ducks in the water, packed: x slot, y kind 0 duck / 1 duckling / 2
+raccoon); `uDrops` (click splashes: document pos, start time, strength).
 
 ## Per-frame pipeline (`renderer.setAnimationLoop`)
 
@@ -204,7 +214,8 @@ scattered blobs, not as the pads' clean cells.
 ## Colours
 
 Palettes in `PALETTES.light/dark` (water, pads, petals, ripple, text=cream,
-accent=#ffb82b used for underlines, duck bill, flower centres). Colours are
+accent=#ffb82b used for underlines, duck bill, flower centres; duckling
+yellow; raccoon grey `raccoon`, `raccoonDark` and `raccoonPale`). Colours are
 sRGB values (`outputColorSpace = LinearSRGBColorSpace`, no conversion).
 
 ## Text
@@ -226,11 +237,24 @@ The water gets its own **smoothed cursor** (`waterCursor`, ~35ms follow, speed
 smoothed over ~60ms): pointer events don't line up with frames, and using the
 raw per-frame movement made slow strokes stutter.
 
-## Ducks (`MAX_DUCKS=2`)
+## Ducks (`MAX_DUCKS=12`)
 
 CPU steers each duck (enter from an edge of the current view, weave via two
-sines, paddle-and-glide speed, exit, rest 3–10s), in **document coords** so
-scrolling doesn't move them. Ducks swim even under
+sines, paddle-and-glide speed, exit), in **document coords** so
+scrolling doesn't move them.
+
+**How many.** One shared spawner (`nextDuck`) sends a duck in from a free
+slot every `cross / DUCKS_IDLE × 0.7–1.3` s, where `cross` is a rough crossing
+time (view's mean side + margins at 0.8×`DUCK_SPEED`). With `DUCKS_IDLE=2.5`
+a quiet pond has ~2.7 ducks on average on any screen size (simulated:
+2–4 about 95% of the time, 5 about 1–2%; the first duck comes at 1.5–4.5s,
+the second 4–9s later). The owner wants it to feel unlimited with
+interaction: ducks that someone's waves keep in the pond stay longer while
+more keep arriving, up to 12. (Fixed spacing like 10–18s gave ~1.6 ducks on
+a phone and ~4.4 on a 1080p screen, hence the scaling.) Ducks keep clear of
+each other: one near ahead (within 2.5× the touching distance) makes a duck
+steer its base heading aside, harder the nearer, and touching ducks get
+nudged apart. Ducks swim even under
 `prefers-reduced-motion` (they're slow and gentle; the owner's phone has iOS
 Reduce Motion on and had no ducks when they were skipped). Reduced motion
 still skips the fly-in intro and calms the ambient drift.
@@ -263,11 +287,16 @@ also has heading and drift. (A first try at 3000 shoved the duck ~400px.)
 ### Ducklings
 
 About half the ducks (`BROOD_CHANCE=0.5`) bring a brood of 3–4 ducklings.
-They use the duck slots after the big ducks' (`MAX_DUCKLINGS=8` shared slots,
+They use the last duck slots, after the big ducks' and raccoons' (`MAX_DUCKLINGS=64` shared slots,
 `isChickSlot(i)`), so every GPU path (cells, shove ellipses, paddling, wake,
 wave readback) handles them like ducks with per-slot sizes (`slotCells`,
-`slotScale`, `slotExtent`; loops over slots are unrolled so sizes are
-compile-time). A duckling is 3 cells at `CHICK=0.46` scale: a round body, a
+`slotScale`, `slotExtent`). The many slots are so one duck can gather a long
+line (the owner wants it to feel unlimited: people herd ducklings from duck
+to duck with waves). The shader loops over ducks (paddling, wake, shove
+ellipses) run only over the ducks in the water (`forEachDuck`: a dynamic
+loop over `uDuckList`, sizes picked per entry), so empty slots cost nothing.
+Unrolled loops over every slot cost ~0.3ms of compute at 76 slots even when
+empty. A duckling is 3 cells at `CHICK=0.46` scale: a round body, a
 big head and a little bill (`chickCells`), in the palette's `duckling`
 yellow (surface code 6) with the accent bill. Splitting it into the duck's 7
 cells read as a scatter of petals at this size; cream tinted toward the
@@ -301,8 +330,82 @@ Ducks shove other nodes out of a duck-shaped ellipse (pads out of one grown
 by their radius, so they're parted, not swallowed), sway a little with
 passing waves, and paddle: their feet (behind the body) pulse into the
 **slow** wave layer at `WAVE_FREQ[1]`, which leaves a V wake of arcs (owner
-likes this a lot). `DUCK_PRESS` (a moving body dent) is 0: it showed as a
-dark dent around the duck.
+likes this a lot). A moving body dent (the old `DUCK_PRESS`) was tried and
+removed: it showed as a dark dent around the duck.
+
+Each shove ellipse is centred on the box around the slot's cells along its
+length (`slotExtent().mid` / `half`), not on the slot's centre, so a
+raccoon's long tail doesn't make it push things far ahead of its nose.
+Ducklings never shove a raccoon's cells (ones ahead of a lunge tore its face
+apart), and a duckling being swallowed neither shoves nor is shoved.
+**Sizes never reach 0 in the shaders** (clamped; a slot nearly gone is also
+dropped from `uDuckList`): a 0 size divided by 0 in the shove ellipse, the
+NaN times the 0 weight was still NaN, and every node's position went NaN for
+good (words, ducks and pads vanished; only water came back, since water
+nodes respawn).
+
+## Raccoons (`MAX_RACCOONS=2`)
+
+Owner asked for raccoons as cute as the ducks that hunt ducklings and
+"absorb" them, which ducks avoid, made to feel natural, fun and satisfying.
+
+**Look** (`coonCells`, `RACCOON_SCALE=1.8`, ~120 css px long, bigger than a
+duck): a chubby round back; a big head; and a bushy tail of five
+alternating dark / fur rings (dark tip) floating out behind. The face is
+built from the front: two dark **eye patches** (surface code 10), each with
+a round dark eye and a white glint toward the light drawn by `padShader`
+(the eye's offset from the cell's centre, `COON_EYE` rotated to the
+raccoon's heading, is packed into lookBuf.z by nodeUpdate, since only the
+front / outer part of a patch is visible), then a short pale muzzle and a
+button nose; behind them a smaller grey crown with a big round pale ear at
+each back corner. Tail cells carry +20 in attr.w and **wag** in a slow wave
+that runs down the tail, swinging more toward the tip; head cells (+10)
+sniff side to side. Designed in a 2D power-diagram prototype first (same
+cell / rounding rules, rendered per pixel on a 2D canvas):
+thin, evenly spaced tail rings and a small head read as a caterpillar; tail
+rings spaced closer than their radius read as one striped tail. Owner asked
+for a cuter face than the first one (mask cells poking out past the crown
+like horns, small ears, a long snout, no eyes); patches placed inside a big
+crown cell lose the power diagram and shrink to slivers, hence the
+front-built face. The eyes made the biggest difference.
+
+**Behaviour** (`updateCoon`, CPU; real raccoons swim well but slowly, head
+up, tail floating, and do take ducklings): it comes in from an edge like a
+duck, slower (`RACCOON_SPEED=0.75`× `DUCK_SPEED`), weaving and sniffing.
+Modes:
+- `cruise`: after its `rest`, spots the nearest duckling in view within
+  `RACCOON_NOTICE=230`px of its mouth (`COON_MOUTH`) → `stalk`.
+- `stalk`: swims at where the duckling is going at `RACCOON_STALK=1.6`×
+  (gains on a duck, not on a fleeing duckling); gives up after 15s or if it
+  gets away (> 1.5× notice). Within `RACCOON_POUNCE=80`px → `crouch`.
+- `crouch`: stops short for 0.28s, fixed on it (the wind-up).
+- `lunge`: 0.5s burst at `RACCOON_LUNGE=6`×, easing off, homing a little.
+  Any duckling within `RACCOON_CATCH=19`px of its mouth is caught →
+  `munch`; else → `recover` (0.9s coast), then stalks again.
+- `munch`: stops and wriggles (body bend `wiggle`) for 1.4s while the
+  duckling (`eaten` timer, `by`) is drawn into its mouth and shrinks to
+  nothing in 0.45s, with a small splash (`splash(…, 0.15)`); the raccoon
+  fills out by `RACCOON_GROW=0.07` per duckling. Then a 5–9s rest; after
+  `RACCOON_FULL=3` it heads for the nearest edge (`leave`).
+A hard wave push (drift > 28px/s) spooks it off the hunt for 4s and turns it
+with the water, so people can save ducklings. Waves push it less than a
+duck (0.6× gain). Two raccoons keep apart.
+
+**Prey and ducks.** Ducklings flee a raccoon within `DUCKLING_FEAR=115`px (+
+a bit for its size; only 0.55× that while it's stalking or crouching, so it
+can creep up, full range once it lunges): a flee velocity scaled by `alarm`
+(rises in ~0.2s, a moment's reaction), up to 2.7× `DUCK_SPEED`, which can
+pull them off their line. They're also kept off its back and tail (CPU
+repulsion from its spine), not its mouth. Big ducks within `DUCK_WARY=170`px
+turn away (not just aside) and hurry (`startle`), leading their broods off.
+`motherOf` never counts a raccoon (or a swallowed duckling) as a line.
+
+**Spawning:** first after 25–45s, then every `RACCOON_EVERY` 50–100s, but
+only while a duckling is in view (else it checks every 3s). Tested: with
+`?ducktest&raccoontest=0.42,0.5,0` every run ended in a catch after 1–3
+lunges with near misses (stalk 1.05× never got close; without the sneaky
+stalk every lunge missed); naturally, the first raccoon arrived at 34s,
+caught one duckling and left at ~95s. 120fps headful, ~+0.1ms compute.
 
 ## Ripples (wave simulation + mosaic)
 
@@ -361,6 +464,9 @@ blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
   scaling: turning passes off sometimes made frames *slower*); A/B with real
   fps instead, interleaving runs against a known-120fps backup, both calm
   (no mouse) and with constant mouse movement.
+- Ducks: with the packed duck loops, the 76-slot pool times the same as the
+  old 10-slot one, and a pond packed full (12 ducks, ~48 ducklings, up to
+  ~47 on screen) still holds 120fps at ~+0.2ms compute.
 - Fragment shader size matters for every pixel (register pressure / occupancy):
   rarely-taken but big branches (pad + flower code) cost ~1.5ms for all
   pixels; move such work into its own pass.
@@ -406,7 +512,9 @@ blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
 Asked for: a large ripple/wave when clicking (see Click splashes); waves
 and ripples affecting the letters (see Letter styling); ducklings in a line
 behind about half the ducks, separable, swimming back to the nearest duck
-(see Ducklings).
+(see Ducklings); more ducks / ducklings that feel unlimited with
+interaction (see Ducks); cute raccoons that hunt and swallow ducklings and
+that ducks avoid (see Raccoons).
 Liked: blobby rounded ripple cells, V wakes (esp. duck wakes and fast cursor
 strokes), clustered pads, Voronoi-cell pads (some bigger, a little Voronoi
 irregularity is fine; veins, lit rim), flowers, ducks parting pads, ducks drawn in the pad style, letters with the same lit

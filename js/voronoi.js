@@ -107,19 +107,47 @@ const DROP_PUSH = [110, 8]; // fast, slow layer
 const DROP_SIGMA = 16; // css px, width of the splash
 const DROP_FREQ = 3; // Hz the fast push swings at (a train of a few rings)
 const DROP_TIME = 0.8; // s, how long the fast push lasts (the slow one: a quarter)
-const DUCK_PRESS = 0;
 const PAD_SWAY = 60; // how far pads sway with passing waves (px per unit slope)
 const TEXT_SWAY = 18; // how far letters' cells sway with passing waves (px per unit slope)
 const TEXT_SWAY_MAX = 2; // css px, cap on a letter cell's sway (keeps letters legible)
 const DUCK_PADDLE = 6; // how hard its feet paddle
 const DUCKLING_PADDLE = 1.2; // (per unit of slow-layer stiffness, which is ~5.7x a duck's for its smaller feet)
 const FACET = 9; // css px, size of the water mosaic's cells
-const MAX_DUCKS = 2; // big ducks
+// Ducks arrive one at a time, spaced so that a quiet pond has about
+// DUCKS_IDLE of them at once (2-4, rarely 5, on any screen size: the spacing
+// scales with how long a duck takes to cross the view). Ducks that someone's
+// waves keep in the pond stay longer while more keep arriving, up to
+// MAX_DUCKS.
+const MAX_DUCKS = 12; // big ducks
+const DUCKS_IDLE = 2.5;
 // Ducklings: about half the ducks bring a brood of 3-4 that swim in a line
-// behind them. They live in duck slots after the big ducks' (slot >=
-// MAX_DUCKS) and are drawn, shoved and pushed by waves just like ducks.
-const MAX_DUCKLINGS = 8;
-const DUCK_SLOTS = MAX_DUCKS + MAX_DUCKLINGS;
+// behind them. They live in the last duck slots (slot >= FIRST_CHICK) and
+// are drawn, shoved and pushed by waves just like ducks.
+// (Plenty of slots, so one duck can gather a long line of them; the shaders
+// only pay for slots in use.)
+const MAX_DUCKLINGS = 64;
+// Raccoons swim through now and then (only while there are ducklings to
+// hunt): they stalk the nearest duckling, crouch, lunge, and swallow it
+// whole, getting a little rounder for each; full after RACCOON_FULL they
+// paddle off. Ducklings flee them and ducks steer clear. Their slots sit
+// between the big ducks' and the ducklings'.
+const MAX_RACCOONS = 2;
+const FIRST_COON = MAX_DUCKS;
+const FIRST_CHICK = MAX_DUCKS + MAX_RACCOONS;
+const DUCK_SLOTS = FIRST_CHICK + MAX_DUCKLINGS;
+const RACCOON_SCALE = 1.8; // (the raccoon is ~70 units long, ~125 css px)
+const RACCOON_EVERY = [50, 100]; // s between raccoons (the first comes after 25-45 s)
+const RACCOON_SPEED = 0.75; // cruising pace (x DUCK_SPEED): slower than a duck
+const RACCOON_STALK = 1.6; // swimming after a duckling (x DUCK_SPEED): gains on a duck, not on a fleeing duckling
+const RACCOON_NOTICE = 230; // css px: it goes after a duckling this close
+const RACCOON_POUNCE = 80; // css px from mouth to duckling when it crouches to lunge
+const RACCOON_LUNGE = 6; // lunge speed (x DUCK_SPEED)
+const RACCOON_CATCH = 19; // css px from its mouth: caught
+const RACCOON_FULL = 3; // ducklings until it's full and leaves
+const RACCOON_GROW = 0.07; // how much rounder it gets per duckling
+const RACCOON_PADDLE = 7;
+const DUCKLING_FEAR = 115; // css px: ducklings flee a raccoon this close
+const DUCK_WARY = 170; // css px: ducks turn away from a raccoon this close
 const BROOD_CHANCE = 0.5;
 const CHICK = 0.46; // a duckling's size relative to a duck
 const DUCKLING_WAVE_PUSH = 1.5; // waves push a duckling this many times harder than a duck
@@ -131,10 +159,15 @@ const DUCK_SCALE = 2; // the duck is ~38 css px long at scale 1
 const DUCK_R = 24 * DUCK_SCALE; // rough radius of a duck, css px
 const DUCK_SPEED = 38; // average swimming speed, css px/s
 const DUCK_WAVE_PUSH = 600; // how hard waves push a duck (per unit of wave energy flux)
-// Duck cell parts (attr.w); +10 marks cells that ride on the bobbing head.
+// Duck cell parts (attr.w); +10 marks cells that ride on the bobbing head,
+// +20 ones on a wagging tail. (Surface code = part + 3, see nodeUpdate.)
 const PART_BODY = 1;
 const PART_BILL = 2;
 const PART_CHICK = 3; // a duckling's (yellow) body
+const PART_FUR = 4; // a raccoon's grey fur
+const PART_MASK = 5; // its dark mask, tail rings and nose
+const PART_PALE = 6; // its pale muzzle and ears
+const PART_EYE = 7; // a dark eye patch with a shiny eye in it
 
 // A duck, top-down, is a handful of big weighted cells drawn like the lily
 // pads (see padShader): a tail, two pairs of body cells (the seam down the
@@ -164,17 +197,58 @@ const chickCells = (() => {
     { x: 16.5, y: 0, r: 3.7, part: PART_BILL + 10 },
   ].map((c) => ({ x: c.x * S, y: c.y * S, r: c.r * S, part: c.part }));
 })();
-const isChickSlot = (i) => i >= MAX_DUCKS;
-const slotCells = (i) => (isChickSlot(i) ? chickCells : duckCells);
-const slotScale = (i) => (isChickSlot(i) ? CHICK : 1);
-// How far a duck's cells reach ahead / behind (rx) and to the side (ry).
+// A raccoon, swimming: a chubby round back, a big head and a bushy tail of
+// alternating fur and dark rings that floats out behind and wags. The face
+// is built from the front: two dark eye patches (each with a shiny eye, see
+// padShader) and a short pale muzzle with a button nose, in front of a
+// smaller crown with a big round pale ear at each back corner. (Cells
+// inside a bigger one lose the power diagram and shrink to slivers, so the
+// patches can't sit on top of the crown; patches poking out past it looked
+// like horns. Tail rings narrower than their radius, so it reads as one
+// striped tail, not a row of beads; a smaller head read as a caterpillar.)
+const coonCells = (() => {
+  const S = RACCOON_SCALE;
+  const T = 20; // (tail)
+  const H = 10; // (head)
+  return [
+    { x: -39.2, y: 0, r: 5.4, part: PART_MASK + T },
+    { x: -33.6, y: 0, r: 6.8, part: PART_FUR + T },
+    { x: -27.6, y: 0, r: 7.4, part: PART_MASK + T },
+    { x: -21.5, y: 0, r: 7.2, part: PART_FUR + T },
+    { x: -15.5, y: 0, r: 6.2, part: PART_MASK + T },
+    { x: -5, y: 0, r: 8.8, part: PART_FUR },
+    { x: 6.8, y: 0, r: 7.9, part: PART_FUR + H },
+    { x: 2.6, y: -8.4, r: 4.3, part: PART_PALE + H },
+    { x: 2.6, y: 8.4, r: 4.3, part: PART_PALE + H },
+    { x: 13.4, y: -4.5, r: 4.3, part: PART_EYE + H },
+    { x: 13.4, y: 4.5, r: 4.3, part: PART_EYE + H },
+    { x: 17.6, y: 0, r: 3.7, part: PART_PALE + H },
+    { x: 20.9, y: 0, r: 2.1, part: PART_MASK + H },
+  ].map((c) => ({ x: c.x * S, y: c.y * S, r: c.r * S, part: c.part }));
+})();
+const COON_MOUTH = 20 * RACCOON_SCALE; // css px ahead of its centre
+// Where the eye sits in its patch (forward, toward the middle; css px) and
+// its size (x the patch's radius). The visible bit of a patch is its front
+// and outer side, so the eye is nudged there to sit wholly inside it.
+const COON_EYE = { fwd: 0.9 * RACCOON_SCALE, inward: 0.35 * RACCOON_SCALE, size: 0.5 };
+const COON_TAIL = -12 * RACCOON_SCALE; // where its tail starts to wag
+const isChickSlot = (i) => i >= FIRST_CHICK;
+const isCoonSlot = (i) => i >= FIRST_COON && i < FIRST_CHICK;
+const slotCells = (i) => (isChickSlot(i) ? chickCells : isCoonSlot(i) ? coonCells : duckCells);
+// How far a duck's cells reach ahead / behind (rx) and to the side (ry),
+// and the box around them along its length (mid: its centre, half: half
+// its length; a raccoon's long tail puts it well behind the raccoon).
 const slotExtent = (i) => {
   const cells = slotCells(i);
+  const back = Math.max(...cells.map((c) => c.r - c.x));
+  const front = Math.max(...cells.map((c) => c.x + c.r));
   return {
     rx: Math.max(...cells.map((c) => Math.abs(c.x) + c.r)),
     ry: Math.max(...cells.map((c) => Math.abs(c.y) + c.r)),
-    back: Math.max(...cells.map((c) => c.r - c.x)),
-    front: Math.max(...cells.map((c) => c.x + c.r)),
+    back,
+    front,
+    mid: (front - back) / 2,
+    half: (front + back) / 2,
   };
 };
 
@@ -194,6 +268,9 @@ const PALETTES = {
     deep: "#10283a",
     accent: "#ffb82b",
     duckling: "#ffd94a",
+    raccoon: "#aaa49b",
+    raccoonDark: "#45413d",
+    raccoonPale: "#efe9de",
   },
   dark: {
     water: "#0f3149",
@@ -210,6 +287,9 @@ const PALETTES = {
     deep: "#081a26",
     accent: "#ffb82b",
     duckling: "#f2cf4e",
+    raccoon: "#8f8a83",
+    raccoonDark: "#302d2b",
+    raccoonPale: "#ddd6c9",
   },
 };
 
@@ -305,7 +385,23 @@ async function main() {
   const duckData = Array.from({ length: DUCK_SLOTS }, () => new THREE.Vector4(-1e5, -1e5, 1, 0));
   const uDucks = uniformArray(duckData, "vec4");
   const duckVel = Array.from({ length: DUCK_SLOTS }, () => new THREE.Vector4());
-  const uDuckVel = uniformArray(duckVel, "vec4"); // xy velocity, z body bend
+  const uDuckVel = uniformArray(duckVel, "vec4"); // xy velocity, z body bend, w size (1 = normal)
+  // The slots of the ducks in the water, packed (x slot, y kind: 0 duck, 1
+  // duckling, 2 raccoon): the shaders loop over just these, so a big pool of
+  // slots costs nothing until ducks fill it.
+  const duckList = Array.from({ length: DUCK_SLOTS }, () => new THREE.Vector4());
+  const uDuckList = uniformArray(duckList, "vec4");
+  const uDuckCount = uniform(0, "int");
+  // Calls body once per duck in the water with its slot, its size and
+  // pick(duck value, duckling value, raccoon value).
+  const forEachDuck = (body) =>
+    Loop({ start: int(0), end: uDuckCount, type: "int", condition: "<", name: "di" }, ({ di }) => {
+      const info = uDuckList.element(di);
+      const chick = info.y.greaterThan(0.5).and(info.y.lessThan(1.5));
+      const coon = info.y.greaterThan(1.5);
+      const slot = int(info.x);
+      body({ slot, size: uDuckVel.element(slot).w, pick: (a, b, c) => select(coon, float(c), select(chick, float(b), float(a))) });
+    });
   // Wave grid (viewport-sized, anchored to the document so waves scroll
   // with the page): size, the document position of cell (0,0)'s corner, how
   // many cells the anchor moved since last frame, the per-substep timestep
@@ -348,6 +444,9 @@ async function main() {
     deep: uDeep,
     accent: uAccent,
     duckling: uDuckling,
+    raccoon: uRaccoon,
+    raccoonDark: uRaccoonDark,
+    raccoonPale: uRaccoonPale,
   } = palette;
 
   const applyPalette = () => {
@@ -507,22 +606,21 @@ async function main() {
       // Ducks: the body presses a dent that travels with it (a moving dent
       // makes a wake), and the paddling feet behind it pulse.
       // (Ducklings: smaller feet, a quicker, gentler paddle.)
-      for (let i = 0; i < DUCK_SLOTS; i++) {
-        const S = DUCK_SCALE * slotScale(i);
-        const chick = isChickSlot(i);
-        const duck = uDucks.element(i);
+      const slowStiff = (r) => WAVE_SPEED[1] ** 2 / r ** 2;
+      forEachDuck(({ slot, size, pick }) => {
+        // (Feet: how far behind its centre, how big; a raccoon paddles all
+        // four under its middle.)
+        const DS = DUCK_SCALE;
+        const CS = DUCK_SCALE * CHICK;
+        const RS = RACCOON_SCALE;
+        const duck = uDucks.element(slot);
         const at2 = duck.xy.add(uScroll);
-        const feet = c.sub(at2.sub(duck.zw.mul((chick ? 7 : 11) * S)));
-        const gFeet = exp(dot(feet, feet).div(-((6 * S) ** 2)));
-        const paddle = sin(uTime.mul(Math.PI * 2 * WAVE_FREQ[1] * (chick ? 1.6 : 1)).add(i * 2.1));
-        const slowStiff = (r) => WAVE_SPEED[1] ** 2 / r ** 2;
-        let push = gFeet.mul(paddle).mul((chick ? DUCKLING_PADDLE : DUCK_PADDLE) * slowStiff(6 * S));
-        if (DUCK_PRESS) {
-          const body = c.sub(at2.sub(duck.zw.mul(3 * S)));
-          push = push.add(exp(dot(body, body).div(-((12 * S) ** 2))).mul(-DUCK_PRESS * slowStiff(12 * S)));
-        }
+        const feet = c.sub(at2.sub(duck.zw.mul(pick(11 * DS, 7 * CS, 5 * RS))));
+        const gFeet = exp(dot(feet, feet).div(pick(-((6 * DS) ** 2), -((6 * CS) ** 2), -((8 * RS) ** 2))));
+        const paddle = sin(uTime.mul(pick(1, 1.6, 0.75).mul(Math.PI * 2 * WAVE_FREQ[1])).add(float(slot).mul(2.1)));
+        const push = gFeet.mul(paddle).mul(pick(DUCK_PADDLE * slowStiff(6 * DS), DUCKLING_PADDLE * slowStiff(6 * CS), RACCOON_PADDLE * slowStiff(8 * RS))).mul(min(size, 1));
         force.addAssign(vec2(0, push));
-      }
+      });
 
       const h = vec2(C.x, C.z);
       const hPrev = vec2(C.y, C.w);
@@ -559,7 +657,7 @@ async function main() {
       const duck = uDucks.element(instanceIndex);
       const centre = duck.xy.add(uScroll);
       // (A duckling feels the water over a smaller disc.)
-      const R = select(int(instanceIndex).lessThan(MAX_DUCKS), float(DUCK_R), float(DUCK_R * CHICK)).toVar();
+      const R = select(int(instanceIndex).lessThan(FIRST_COON), float(DUCK_R), select(int(instanceIndex).lessThan(FIRST_CHICK), float(DUCK_R * 1.15), float(DUCK_R * CHICK))).toVar();
       const sum = vec4(0).toVar();
       const cell = (qx, qy) => buf.element(max(min(qy, uWH.sub(1)), int(0)).mul(uWW).add(max(min(qx, uWW.sub(1)), int(0))));
       Loop(81, ({ i }) => {
@@ -697,15 +795,15 @@ async function main() {
     const energy = max(f.x.mul(exp(uDt.mul(-1.4))), splat).toVar();
     const flow = mix(f.yz.mul(exp(uDt.mul(-2.2))), uMouseVel, clamp(splat, 0, 1)).toVar();
     // Ducks stir the water too, leaving a gentler wake behind them.
-    for (let i = 0; i < DUCK_SLOTS; i++) {
-      const duck = uDucks.element(i);
-      const R = DUCK_R * slotScale(i);
+    forEachDuck(({ slot, size, pick }) => {
+      const duck = uDucks.element(slot);
+      const R = pick(DUCK_R, DUCK_R * CHICK, DUCK_R * 1.15).mul(max(size, 0.05));
       // Centred behind the duck so it doesn't shake its own cells apart.
-      const dd = c.sub(duck.xy.sub(duck.zw.mul(R * 1.3)));
-      const duckSplat = exp(dot(dd, dd).div(-R * R)).mul(isChickSlot(i) ? 0.25 : 0.4);
+      const dd = c.sub(duck.xy.sub(duck.zw.mul(R.mul(1.3))));
+      const duckSplat = exp(dot(dd, dd).div(R.mul(R).negate())).mul(pick(0.4, 0.25, 0.45));
       energy.assign(max(energy, duckSplat));
       flow.assign(mix(flow, duck.zw.mul(DUCK_SPEED * 6), clamp(duckSplat, 0, 1)));
-    }
+    });
     // (Nodes read the water's height from here: it saves them a buffer.)
     const wave = waveAt(waveView, c.add(uScroll)).height;
     f.assign(vec4(energy, flow, wave.x.add(wave.y)));
@@ -722,7 +820,11 @@ async function main() {
     const v = P.zw.toVar();
     const isBg = Hm.w.lessThan(0.5);
     const isDuck = Hm.w.greaterThan(3.5).and(Hm.w.lessThan(4.5));
-    const spacing = A.y;
+    // (A duck cell's slot, and that slot's size: a duckling being swallowed
+    // shrinks away, a raccoon gets rounder with each one.)
+    const duckIdx = max(int(A.x), int(0));
+    const slotSize = select(isDuck, uDuckVel.element(duckIdx).w, float(1));
+    const spacing = A.y.mul(max(slotSize, 0.02)); // (never 0: some maths below divides by it)
     const rnd = A.z;
 
     // Intro: nodes start scattered and lock on in a staggered wave.
@@ -797,14 +899,19 @@ async function main() {
     // cells bob side to side). They chase it with the duck's own velocity fed
     // forward, so the duck keeps its shape while swimming but can still be
     // knocked apart and reassemble.
-    const duckIdx = max(int(A.x), int(0));
     const duck = uDucks.element(duckIdx);
     const duckV = select(isDuck, uDuckVel.element(duckIdx).xy, vec2(0));
-    const onHead = A.w.greaterThan(9.5);
-    const isChick = duckIdx.greaterThanEqual(MAX_DUCKS);
-    // (Ducklings bob their heads quicker.)
-    const bob = sin(uTime.mul(select(isChick, float(2.6), float(1.4))).add(A.x.mul(40))).mul(select(isChick, float(0.9 * DUCK_SCALE * CHICK), float(1.2 * DUCK_SCALE)));
-    const straight = Hm.xy.add(vec2(0, select(onHead, bob, float(0))));
+    const onHead = A.w.greaterThan(9.5).and(A.w.lessThan(19.5));
+    const onTail = A.w.greaterThan(19.5);
+    const isChick = duckIdx.greaterThanEqual(FIRST_CHICK);
+    const isCoon = duckIdx.greaterThanEqual(FIRST_COON).and(isChick.not());
+    const kindVal = (a, b, c) => select(isCoon, float(c), select(isChick, float(b), float(a)));
+    // (Ducklings bob their heads quicker; a raccoon sniffs from side to side.)
+    const bob = sin(uTime.mul(kindVal(1.4, 2.6, 1.1)).add(A.x.mul(40))).mul(kindVal(1.2 * DUCK_SCALE, 0.9 * DUCK_SCALE * CHICK, 0.8 * RACCOON_SCALE));
+    // A raccoon's tail floats out behind and wags in a slow wave that runs
+    // down it, swinging more toward the tip.
+    const wag = sin(uTime.mul(2.3).add(A.x.mul(1.7)).add(Hm.x.mul(0.05))).mul(Hm.x.negate().add(COON_TAIL).mul(0.11));
+    const straight = Hm.xy.add(vec2(0, select(onHead, bob, select(onTail, wag, float(0))))).mul(slotSize);
     // Bend the body along its turn: rotating each cell by an angle
     // proportional to how far forward it is curls head and tail into an arc.
     const bend = straight.x.mul(uDuckVel.element(duckIdx).z);
@@ -837,21 +944,31 @@ async function main() {
     // of one grown by their radius, so a duck parts them like real ones
     // instead of overlapping them.
     const padReach = select(isPadNode, padSize.mul(0.9), float(0));
-    for (let i = 0; i < DUCK_SLOTS; i++) {
+    const ext = [slotExtent(0), slotExtent(FIRST_CHICK), slotExtent(FIRST_COON)];
+    // (A duckling being swallowed neither shoves nor is shoved: it slips
+    // into the raccoon's mouth.)
+    const gulped = isDuck.and(slotSize.lessThan(0.98));
+    forEachDuck(({ slot, size, pick }) => {
       // (Tail to bill tip and side to side, plus a margin.)
-      const ext = slotExtent(i);
-      const rx = padReach.add(ext.rx + 4);
-      const ry = padReach.add(ext.ry + 4);
-      const other = uDucks.element(i);
-      const away = p.sub(uScroll).sub(other.xy);
+      // (Sizes kept above 0: a NaN here would poison every node for good.)
+      const sz = max(size, 0.05);
+      const rx = padReach.add(pick(...ext.map((e) => e.half + 4)).mul(sz));
+      const ry = padReach.add(pick(...ext.map((e) => e.ry + 4)).mul(sz));
+      const other = uDucks.element(slot);
+      const away = p.sub(uScroll).sub(other.xy.add(other.zw.mul(pick(...ext.map((e) => e.mid)).mul(sz))));
       const side = vec2(other.w.negate(), other.z);
       const lx = dot(away, other.zw);
       const ly = dot(away, side);
       const inside = float(1).sub(length(vec2(lx.div(rx), ly.div(ry))));
       const normal = normalize(other.zw.mul(lx.div(rx.mul(rx))).add(side.mul(ly.div(ry.mul(ry)))).add(vec2(1e-6, 0)));
-      const own = isDuck.and(duckIdx.equal(i));
-      acc.addAssign(normal.mul(select(own, float(0), max(inside, 0).mul(select(isPadNode, float(4000), float(2600))))));
-    }
+      const own = isDuck.and(duckIdx.equal(slot));
+      // (Ducklings don't shove a raccoon's cells: ones ahead of a lunge tore
+      // its face apart.)
+      const otherKind = pick(0, 1, 2);
+      const predPrey = isDuck.and(isCoon).and(otherKind.greaterThan(0.5)).and(otherKind.lessThan(1.5));
+      const off = own.or(gulped).or(size.lessThan(0.98)).or(predPrey);
+      acc.addAssign(select(off, vec2(0), normal.mul(max(inside, 0).mul(select(isPadNode, float(4000), float(2600))))));
+    });
 
     // Pads ride the waves: they sway with the water (drawn offset down its
     // slope, like the water's own back-and-forth under a passing ripple),
@@ -901,7 +1018,7 @@ async function main() {
     const lifted = clamp(lift.mul(0.35).add(0.45), 0.02, 0.9);
     const surface = select(
       isDuck,
-      part.add(3).add(lifted), // 4 body / 5 bill / 6 duckling body
+      part.add(3).add(lifted), // 4 body / 5 bill / 6 duckling body / 7 raccoon fur / 8 its mask / 9 its muzzle / 10 its eye patch
       select(
         isInk,
         float(2).add(hover.mul(G.y).mul(0.9)),
@@ -917,7 +1034,13 @@ async function main() {
     // (For a pad or duck cell, y is its radius.)
     // (For glyph and bar cells, z packs the water's lift into its fraction:
     // floor(rnd * 32) + lifted.)
-    const lookRnd = select(isInk.or(inBar), floor(rnd.mul(32)).add(lifted), rnd);
+    // (For a raccoon's eye patch, z packs where the eye is, from the cell's
+    // centre in screen px: x and y in quarter px, offset by 16 px.)
+    const eyeLocal = vec2(COON_EYE.fwd, sign(Hm.y).mul(-COON_EYE.inward)).mul(slotSize);
+    const eyeOff = clamp(duck.zw.mul(eyeLocal.x).add(vec2(duck.w.negate(), duck.z).mul(eyeLocal.y)), -15, 15);
+    const eyePack = floor(eyeOff.x.add(16).mul(4).add(0.5)).mul(256).add(floor(eyeOff.y.add(16).mul(4).add(0.5)));
+    const isEye = isDuck.and(part.greaterThan(PART_EYE - 0.5));
+    const lookRnd = select(isInk.or(inBar), floor(rnd.mul(32)).add(lifted), select(isEye, eyePack, rnd));
     lookBuf.element(instanceIndex).assign(vec4(surface, select(isPadNode, padR, spacing), lookRnd, extra));
   })().compute(MAX_NODES);
 
@@ -1174,7 +1297,8 @@ async function main() {
 
 
   // Lily pads and duck cells ("leaves") are weighted cells drawn by the pad
-  // pass; surface codes 1 (pad), 4 (duck body), 5 (bill), 6 (duckling body).
+  // pass; surface codes 1 (pad), 4 (duck body), 5 (bill), 6 (duckling body),
+  // 7-10 (raccoon fur, mask, muzzle, eye patch).
   const isLeafCode = (x) => {
     const code = floor(x);
     return code.equal(1).or(code.greaterThan(3.5));
@@ -1225,6 +1349,10 @@ async function main() {
           const isDuck = floor(look.x).greaterThan(3.5);
           const isBill = floor(look.x).equal(5);
           const isChick = floor(look.x).equal(6);
+          const isFur = floor(look.x).equal(7);
+          const isEye = floor(look.x).equal(10);
+          const isMask = floor(look.x).equal(8).or(isEye);
+          const isPale = floor(look.x).equal(9);
           const base = id.mul(5);
           const pe2 = float(1e6).toVar();
           const pe3 = float(1e6).toVar();
@@ -1269,9 +1397,15 @@ async function main() {
           // body and accent-orange bill (ducklings: a downy yellow body).
           // Each with a lighter and darker tone for the light; lighter riding
           // a crest, darker in a trough.
-          const duckBase = select(isBill, vec3(uAccent), select(isChick, vec3(uDuckling), vec3(uText)));
+          // (Raccoons: grey fur, a dark mask, tail rings and nose, a pale
+          // muzzle and ears.)
+          const duckBase = select(
+            isBill,
+            vec3(uAccent),
+            select(isChick, vec3(uDuckling), select(isFur, vec3(uRaccoon), select(isMask, vec3(uRaccoonDark), select(isPale, vec3(uRaccoonPale), vec3(uText))))),
+          );
           const baseCol = select(isDuck, duckBase, mix(uPad, uPadLight, fract(rnd.mul(13.7))));
-          const light = select(isDuck, mix(duckBase, vec3(1), 0.45), vec3(uPadLight).mul(1.18));
+          const light = select(isDuck, mix(duckBase, vec3(1), select(isMask, float(0.22), float(0.45))), vec3(uPadLight).mul(1.18));
           const shade = select(isDuck, duckBase.mul(select(isBill, float(0.8), float(0.82))), vec3(uPadRim));
           const edgeCol = select(isDuck, duckBase.mul(select(isBill, float(0.72), float(0.74))), vec3(uPadRim));
           const padLift = fract(look.x).sub(0.45);
@@ -1289,6 +1423,16 @@ async function main() {
           leafCol.assign(mix(leafCol, select(facing.greaterThan(0), light, shade), rimBand.mul(abs(facing)).mul(0.45)));
           // ...and a thin darker edge.
           leafCol.assign(mix(leafCol, edgeCol, smoothstep(-1.6, 0, shape)));
+          // A raccoon's eye: a dark round pupil in its patch with a white
+          // glint toward the light (top left).
+          If(isEye, () => {
+            const eye = vec2(floor(rnd.div(256)), mod(rnd, 256)).div(4).sub(16);
+            const pr = r.mul(COON_EYE.size);
+            const de = length(rel.sub(eye));
+            leafCol.assign(mix(leafCol, vec3(0.07, 0.06, 0.06), float(1).sub(smoothstep(pr.sub(aa), pr.add(aa), de))));
+            const dg = length(rel.sub(eye.add(vec2(-0.6, -0.8).mul(pr.mul(0.42)))));
+            leafCol.assign(mix(leafCol, vec3(1), float(1).sub(smoothstep(pr.mul(0.32).sub(aa), pr.mul(0.32).add(aa), dg))));
+          });
           sCol.assign(leafCol);
           sFill.assign(fill);
 
@@ -1945,31 +2089,43 @@ async function main() {
   addEventListener("blur", deactivate);
   addEventListener("pointerup", (e) => e.pointerType === "touch" && deactivate());
   // A click or tap splashes the water (the oldest splash slot is reused).
+  // (Document px; strength 1 is a click's.)
   let nextDrop = 0;
+  const splash = (x, y, strength) => {
+    dropData[nextDrop].set(x, y, uTime.value, strength);
+    nextDrop = (nextDrop + 1) % MAX_DROPS;
+  };
   addEventListener("pointerdown", (e) => {
     if (e.button !== 0 || e.target.closest?.(".dev-menu")) return;
-    dropData[nextDrop].set(e.clientX + scrollX, e.clientY + scrollY, uTime.value, 1);
-    nextDrop = (nextDrop + 1) % MAX_DROPS;
+    splash(e.clientX + scrollX, e.clientY + scrollY, 1);
   });
 
   // ------------------------------------------------------------------ ducks
 
   // Each duck enters from a random edge, heads for a random point on the
-  // opposite edge with a lazily swaying heading, and leaves. Then it rests a
-  // while before coming back.
+  // opposite edge with a lazily swaying heading, and leaves (a new one
+  // arrives every so often, see DUCKS_IDLE, while there's a free slot). Ducks turn to
+  // keep clear of each other.
   //
-  // About half of them bring a brood of 3-4 ducklings (the slots after the
-  // big ducks'). Each duckling follows the duck in front of it on a short
+  // About half of them bring a brood of 3-4 ducklings (the last slots).
+  // Each duckling follows the duck in front of it on a short
   // rope, so they trail in a line. Waves push ducklings much harder than
   // ducks; one knocked too far from its place (or startled by a hard push)
   // loses its line, which closes up behind it. After a moment's daze it
   // hurries to the nearest duck and joins the end of that duck's line.
+  //
+  // Raccoons (see updateCoon) hunt the ducklings; ducklings flee them and
+  // ducks steer well clear.
   const ducks = Array.from({ length: DUCK_SLOTS }, (_, i) => ({
     active: false,
     chick: isChickSlot(i),
+    coon: isCoonSlot(i),
     leader: -1,
-    wait: 1.5 + i * 5 + Math.random() * 3,
+    size: 1,
   }));
+  // (The first duck comes soon and the second not long after.)
+  let nextDuck = 1.5 + Math.random() * 3;
+  let arrivals = 0;
   const extents = Array.from({ length: DUCK_SLOTS }, (_, i) => slotExtent(i));
   // Centre-to-centre distance of duckling i swimming behind duck j (clear of
   // each other's shove ellipses, see nodeUpdate).
@@ -1977,7 +2133,7 @@ async function main() {
   // ?ducktest drops the first duck straight into open water, for tuning
   // (always with a brood).
   const duckTest = params.has("ducktest");
-  if (duckTest) ducks[0].wait = 0;
+  if (duckTest) nextDuck = 0;
   const between = (a, b) => a + Math.random() * (b - a);
   const offScreen = (d, m) => {
     const vx = d.x - scrollX;
@@ -1988,7 +2144,7 @@ async function main() {
   const motherOf = (i) => {
     for (let k = 0; k <= DUCK_SLOTS && i >= 0; k++) {
       const d = ducks[i];
-      if (!d.active) return -1;
+      if (!d.active || d.coon || d.eaten) return -1;
       if (!d.chick) return i;
       i = d.leader;
     }
@@ -2026,12 +2182,19 @@ async function main() {
       dx: 0,
       dy: 0,
       daze: 0,
+      alarm: 0, // how scared of a raccoon (0-1)
+      eaten: 0, // s since a raccoon caught it (0 = not caught)
+      by: -1, // (which raccoon)
+      size: 1,
     });
   };
-  const spawnDuck = (d, i) => {
+  // A way across the view: in at a random edge (margin m outside it), out
+  // at a random point on the opposite one. Ducks live in document
+  // coordinates (they stay put in the pond when the page scrolls); they
+  // enter at the edge of whatever is in view.
+  const route = (m) => {
     const w = innerWidth;
     const h = innerHeight;
-    const m = DUCK_R * 1.5;
     const edge = (side) =>
       [
         [-m, between(0.1, 0.9) * h],
@@ -2042,15 +2205,17 @@ async function main() {
     const side = Math.floor(Math.random() * 4);
     const [sx, sy] = edge(side);
     const [tx, ty] = edge(side ^ 1);
-    // Ducks live in document coordinates (they stay put in the pond when the
-    // page scrolls); they enter at the edge of whatever is in view.
+    return { x: sx + scrollX, y: sy + scrollY, heading: Math.atan2(ty - sy, tx - sx) };
+  };
+  const spawnDuck = (d, i) => {
+    const r = route(DUCK_R * 1.5);
     Object.assign(d, {
       active: true,
       age: 0,
-      x: sx + scrollX,
-      y: sy + scrollY,
-      base: Math.atan2(ty - sy, tx - sx),
-      heading: Math.atan2(ty - sy, tx - sx),
+      x: r.x,
+      y: r.y,
+      base: r.heading,
+      heading: r.heading,
       speed: between(0.75, 1.25) * DUCK_SPEED,
       phase: Math.random() * 100,
       vx: 0,
@@ -2086,6 +2251,8 @@ async function main() {
   // Waves push a duck: the water's push (wave energy flux around it, from
   // the GPU) drives a drift velocity that water drag slows down. Returns how
   // fast it's drifting.
+  // Signed turn from angle b to angle a, in (-pi, pi].
+  const angleTo = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
   const waveDrift = (d, i, gain, cap, dragRate, dt) => {
     const w = duckPush[i];
     let ax = w.x * gain;
@@ -2111,6 +2278,37 @@ async function main() {
       d.base += diff * Math.min(1, drift / 30) * (1 - Math.exp(-dt * 1.6));
     }
     d.startle = Math.max(d.startle * Math.exp(-dt * 0.8), Math.min(1, drift / 40));
+    // Give other ducks room: steer aside from one near ahead, the harder the
+    // nearer, and get nudged apart if they still touch.
+    let px = 0;
+    let py = 0;
+    ducks.forEach((o, j) => {
+      if (j === i || !o.active || o.chick) return;
+      const ax = d.x - o.x;
+      const ay = d.y - o.y;
+      const al = Math.hypot(ax, ay) || 1;
+      if (o.coon) {
+        // A raccoon: turn away from it (not just aside), harder the nearer,
+        // and hurry, so her ducklings are led away too.
+        const near = 1 - al / DUCK_WARY;
+        if (near > 0) {
+          d.base += angleTo(Math.atan2(ay, ax), d.base) * Math.min(1, near * 1.6) * (1 - Math.exp(-dt * 2.5));
+          d.startle = Math.max(d.startle, Math.min(1, near * 1.4));
+        }
+        return;
+      }
+      const minD = extents[i].rx + extents[j].ry + 8;
+      const fx = Math.cos(d.heading);
+      const fy = Math.sin(d.heading);
+      if (al < minD * 2.5 && fx * ax + fy * ay < 0) {
+        const side = fx * ay - fy * ax; // which side of us it's on
+        d.base += Math.sign(side || 1) * (1 - al / (minD * 2.5)) * 1.2 * dt;
+      }
+      if (al < minD) {
+        px += (ax / al) * (minD - al) * 3;
+        py += (ay / al) * (minD - al) * 3;
+      }
+    });
     // Weave: a slow meander plus a quicker side-to-side.
     const sway = 0.7 * Math.sin(t * 0.45 + d.phase) + 0.35 * Math.sin(t * 1.15 + d.phase * 1.7);
     const before = d.heading;
@@ -2120,19 +2318,30 @@ async function main() {
     d.bend += (Math.max(-0.012, Math.min(0.012, (turn / d.speed) * 0.9)) - d.bend) * (1 - Math.exp(-dt * 5));
     // Paddle-and-glide rhythm.
     const v = d.speed * (0.8 + 0.25 * Math.sin(t * 2.2 + d.phase)) * (1 + 0.6 * d.startle);
-    d.vx = Math.cos(d.heading) * v + d.dx;
-    d.vy = Math.sin(d.heading) * v + d.dy;
+    d.vx = Math.cos(d.heading) * v + d.dx + px;
+    d.vy = Math.sin(d.heading) * v + d.dy + py;
     d.x += d.vx * dt;
     d.y += d.vy * dt;
     // She leaves once she and her whole brood are out of view.
     const brood = ducks.some((c, ci) => c.active && c.chick && motherOf(ci) === i && !offScreen(c, DUCK_R));
-    if (d.age > 2 && offScreen(d, DUCK_R * 2) && !brood) {
-      d.active = false;
-      d.wait = between(3, 10);
-    }
+    if (d.age > 2 && offScreen(d, DUCK_R * 2) && !brood) d.active = false;
   };
   const updateChick = (c, i, dt, t) => {
     c.age += dt;
+    if (c.eaten > 0) {
+      // Caught: drawn into the raccoon's mouth, shrinking away to nothing.
+      const R = ducks[c.by];
+      c.eaten += dt;
+      const k = 1 - Math.exp(-dt * 18);
+      c.x += (R.x + Math.cos(R.heading) * COON_MOUTH * R.size - c.x) * k;
+      c.y += (R.y + Math.sin(R.heading) * COON_MOUTH * R.size - c.y) * k;
+      c.vx = R.vx;
+      c.vy = R.vy;
+      c.bend = 0;
+      c.size = 0.97 * Math.max(0, 1 - (c.eaten / 0.45) ** 2);
+      if (c.eaten > 0.5) Object.assign(c, { active: false, eaten: 0, size: 1 });
+      return;
+    }
     // Light: waves shove ducklings about more than ducks (but they paddle
     // against it, so it dies down sooner).
     const drift = waveDrift(c, i, DUCK_WAVE_PUSH * DUCKLING_WAVE_PUSH, 260, 3.2, dt);
@@ -2197,18 +2406,57 @@ async function main() {
     }
     let vx = tvx + (tx - c.x) * 2.4;
     let vy = tvy + (ty - c.y) * 2.4;
+    // A raccoon! Once it sinks in (a moment's reaction), paddle away from
+    // it as fast as a duckling can, off the line if need be. (One creeping
+    // up is only noticed much closer; one lunging, at once.)
+    let fx = 0;
+    let fy = 0;
+    let fear = 0;
+    ducks.forEach((o) => {
+      if (!o.active || !o.coon) return;
+      const ax = c.x - o.x;
+      const ay = c.y - o.y;
+      const al = Math.hypot(ax, ay) || 1;
+      const sneaky = o.mode === "stalk" || o.mode === "crouch" ? 0.55 : 1;
+      const near = 1 - al / ((DUCKLING_FEAR + extents[FIRST_COON].half * 0.5) * sneaky);
+      if (near > 0) {
+        fx += (ax / al) * near;
+        fy += (ay / al) * near;
+        fear = Math.max(fear, Math.min(1, near * 2));
+      }
+    });
+    c.alarm += (fear - c.alarm) * (1 - Math.exp(-dt * (fear > c.alarm ? 5 : 0.8)));
+    if (c.alarm > 0.01) {
+      const fl = Math.hypot(fx, fy) || 1;
+      vx += (fx / fl) * c.alarm * DUCK_SPEED * 4;
+      vy += (fy / fl) * c.alarm * DUCK_SPEED * 4;
+      maxSpeed = Math.max(maxSpeed, DUCK_SPEED * (1.8 + 0.9 * c.alarm));
+    }
     const vl = Math.hypot(vx, vy);
     if (vl > maxSpeed) {
       vx *= maxSpeed / vl;
       vy *= maxSpeed / vl;
     }
-    // Keep out of other ducks' way.
+    // Keep out of other ducks' way (and off a raccoon's back and tail; its
+    // mouth is another matter).
     ducks.forEach((o, j) => {
-      if (j === i || !o.active) return;
-      const ax = c.x - o.x;
-      const ay = c.y - o.y;
+      if (j === i || !o.active || o.eaten) return;
+      let ox = o.x;
+      let oy = o.y;
+      let minD = extents[i].rx + extents[j].ry + 4;
+      if (o.coon) {
+        const hx = Math.cos(o.heading);
+        const hy = Math.sin(o.heading);
+        // (Nearest point on its spine, from its middle back to near the
+        // tail tip.)
+        const along = Math.max(-(extents[j].back - extents[j].ry) * o.size, Math.min(0, (c.x - o.x) * hx + (c.y - o.y) * hy));
+        ox = o.x + hx * along;
+        oy = o.y + hy * along;
+        minD = extents[i].ry + extents[j].ry * o.size + 2;
+      }
+      const ax = c.x - ox;
+      const ay = c.y - oy;
       const al = Math.hypot(ax, ay) || 1;
-      const minD = extents[i].rx + extents[j].ry + 4;
       if (al < minD) {
         vx += (ax / al) * (minD - al) * 5;
         vy += (ay / al) * (minD - al) * 5;
@@ -2234,29 +2482,247 @@ async function main() {
     // Gone once out of view with no line to swim in (its mother has left).
     if (motherOf(i) < 0 && offScreen(c, DUCK_R)) c.active = false;
   };
-  const updateDucks = (dt, t) => {
-    ducks.forEach((d, i) => {
-      if (d.active) (d.chick ? updateChick : updateDuck)(d, i, dt, t);
-      else if (!d.chick) {
-        d.wait -= dt;
-        // (Ducks swim even with reduced motion: they're slow and gentle.)
-        if (d.wait <= 0) spawnDuck(d, i);
+  // A raccoon comes in from an edge like a duck, but slower, sniffing from
+  // side to side (real ones swim well but slowly, head up, tail floating out
+  // behind). While there's room in its belly it hunts:
+  //   cruise: swims on; spots the nearest duckling within RACCOON_NOTICE
+  //   stalk: creeps toward where the duckling is going, until within
+  //     RACCOON_POUNCE of its mouth
+  //   crouch: stops short for a beat, fixed on it (the wind-up that sells
+  //     the lunge)
+  //   lunge: a quick burst at it, homing a little; any duckling within
+  //     RACCOON_CATCH of its mouth is caught, else it overshoots
+  //   recover: coasts, shakes it off, then stalks again (or gives up)
+  //   munch: stops and wriggles happily while the duckling shrinks into its
+  //     mouth with a little splash, and fills out a bit (RACCOON_GROW); then
+  //     a rest before hunting again, or, full, it leaves.
+  // A hard push from the waves spooks it off the hunt for a while, so people
+  // can save ducklings.
+  const coonTest = params.has("raccoontest");
+  let nextCoon = coonTest ? 1.5 : between(25, 45);
+  const spawnCoon = (r, i) => {
+    const w = route(DUCK_R * 2.5);
+    Object.assign(r, {
+      active: true,
+      age: 0,
+      x: w.x,
+      y: w.y,
+      base: w.heading,
+      heading: w.heading,
+      phase: Math.random() * 100,
+      vx: 0,
+      vy: 0,
+      dx: 0,
+      dy: 0,
+      bend: 0,
+      wiggle: 0,
+      spd: RACCOON_SPEED * DUCK_SPEED,
+      mode: "cruise",
+      modeT: 0,
+      rest: 2, // s before it starts hunting
+      prey: -1,
+      hunt: 0, // s spent on this hunt
+      meals: 0,
+      size: 1,
+    });
+    if (coonTest && i === FIRST_COON) {
+      // ?raccoontest=x,y,heading (fractions of the view, radians) to aim it.
+      const [fx = 0.25, fy = 0.5, fh = 0] = (params.get("raccoontest") || "").split(",").filter(Boolean).map(Number);
+      Object.assign(r, { x: scrollX + innerWidth * fx, y: scrollY + innerHeight * fy, base: fh, heading: fh, age: 3, rest: 0.5 });
+    }
+  };
+  const updateCoon = (r, i, dt, t) => {
+    r.age += dt;
+    r.modeT += dt;
+    r.rest -= dt;
+    const set = (mode) => {
+      r.mode = mode;
+      r.modeT = 0;
+    };
+    // Heavier than a duck: waves push it less, but a hard push spooks it.
+    const drift = waveDrift(r, i, DUCK_WAVE_PUSH * 0.6, 120, 2.6, dt);
+    if (drift > 28 && r.mode !== "munch" && r.mode !== "leave") {
+      if (r.mode !== "cruise") set("cruise");
+      r.prey = -1;
+      r.rest = Math.max(r.rest, 4);
+      r.base += angleTo(Math.atan2(r.dy, r.dx), r.base) * (1 - Math.exp(-dt * 2));
+    }
+    const mx = r.x + Math.cos(r.heading) * COON_MOUTH * r.size;
+    const my = r.y + Math.sin(r.heading) * COON_MOUTH * r.size;
+    const P = r.prey >= 0 ? ducks[r.prey] : null;
+    const preyOk = P && P.active && !P.eaten;
+    const preyDist = preyOk ? Math.hypot(P.x - mx, P.y - my) : Infinity;
+    let speed = RACCOON_SPEED; // (x DUCK_SPEED)
+    let turn = 1.5; // how fast it turns to its heading (1/s)
+    let sniff = 1; // how much it weaves
+    if (r.mode === "cruise") {
+      if (r.rest <= 0 && r.meals < RACCOON_FULL) {
+        let best = -1;
+        let bd = RACCOON_NOTICE;
+        ducks.forEach((c, j) => {
+          if (!c.active || !c.chick || c.eaten || offScreen(c, -10)) return;
+          const dd = Math.hypot(c.x - mx, c.y - my);
+          if (dd < bd) {
+            bd = dd;
+            best = j;
+          }
+        });
+        if (best >= 0) {
+          r.prey = best;
+          r.hunt = 0;
+          set("stalk");
+        }
+      }
+    } else if (r.mode === "stalk") {
+      r.hunt += dt;
+      if (!preyOk || preyDist > RACCOON_NOTICE * 1.5 || r.hunt > 15) {
+        // Gave up.
+        r.prey = -1;
+        r.rest = between(3, 6);
+        set("cruise");
+      } else {
+        const lead = Math.min(preyDist / (RACCOON_STALK * DUCK_SPEED), 1);
+        r.base = Math.atan2(P.y + P.vy * lead - my, P.x + P.vx * lead - mx);
+        speed = RACCOON_STALK;
+        turn = 3;
+        sniff = 0.2;
+        if (preyDist < RACCOON_POUNCE) set("crouch");
+      }
+    } else if (r.mode === "crouch") {
+      speed = 0.1;
+      turn = 6;
+      sniff = 0;
+      if (preyOk) r.base = Math.atan2(P.y - my, P.x - mx);
+      if (!preyOk) set("cruise");
+      else if (r.modeT > 0.28) set("lunge");
+    } else if (r.mode === "lunge") {
+      const k = Math.min(r.modeT / 0.5, 1);
+      speed = RACCOON_LUNGE * (1 - 0.5 * k * k);
+      turn = 2.5;
+      sniff = 0;
+      if (preyOk) r.base = Math.atan2(P.y - my, P.x - mx);
+      let caught = -1;
+      let cd = RACCOON_CATCH * r.size;
+      ducks.forEach((c, j) => {
+        if (!c.active || !c.chick || c.eaten) return;
+        const dd = Math.hypot(c.x - mx, c.y - my);
+        if (dd < cd) {
+          cd = dd;
+          caught = j;
+        }
+      });
+      if (caught >= 0) {
+        const c = ducks[caught];
+        loseLine(c, caught);
+        Object.assign(c, { eaten: 1e-3, by: i, size: 0.97 });
+        splash(mx, my, 0.15);
+        r.meals++;
+        r.prey = -1;
+        set("munch");
+      } else if (r.modeT > 0.5) set("recover");
+    } else if (r.mode === "recover") {
+      speed = 0.35;
+      sniff = 0.3;
+      if (r.modeT > 0.9) {
+        if (preyOk && r.hunt < 15) set("stalk");
+        else {
+          r.rest = between(2, 4);
+          set("cruise");
+        }
+      }
+    } else if (r.mode === "munch") {
+      speed = 0.05;
+      sniff = 0;
+      if (r.modeT > 1.4) {
+        r.rest = between(5, 9);
+        if (r.meals < RACCOON_FULL) set("cruise");
+        else {
+          // Full: off to the nearest edge.
+          const vx = r.x - scrollX;
+          const vy = r.y - scrollY;
+          const ways = [
+            [vx, Math.PI],
+            [innerWidth - vx, 0],
+            [vy, -Math.PI / 2],
+            [innerHeight - vy, Math.PI / 2],
+          ].sort((a, b) => a[0] - b[0]);
+          r.base = ways[0][1];
+          set("leave");
+        }
+      }
+    } else if (r.mode === "leave") {
+      speed = 0.85;
+    }
+    // (Happy wriggle while munching.)
+    r.wiggle = r.mode === "munch" ? 0.012 * Math.sin(r.modeT * 16) * Math.max(0, 1 - r.modeT / 1.4) : 0;
+    r.size += (1 + RACCOON_GROW * r.meals - r.size) * (1 - Math.exp(-dt * 1.2));
+    const sway = sniff * (0.45 * Math.sin(t * 0.5 + r.phase) + 0.2 * Math.sin(t * 1.3 + r.phase * 1.7));
+    const before = r.heading;
+    r.heading += angleTo(r.base + sway, r.heading) * (1 - Math.exp(-dt * turn));
+    const turnRate = angleTo(r.heading, before) / Math.max(dt, 1e-3);
+    r.spd += (speed * DUCK_SPEED - r.spd) * (1 - Math.exp(-dt * (r.mode === "lunge" ? 12 : 3)));
+    r.bend += (Math.max(-0.008, Math.min(0.008, (turnRate / Math.max(r.spd, 20)) * 0.9)) - r.bend) * (1 - Math.exp(-dt * 5));
+    // Steady dog-paddle, and room for the other raccoon.
+    const v = r.spd * (0.9 + 0.12 * Math.sin(t * 1.8 + r.phase));
+    let px = 0;
+    let py = 0;
+    ducks.forEach((o, j) => {
+      if (j === i || !o.active || !o.coon) return;
+      const ax = r.x - o.x;
+      const ay = r.y - o.y;
+      const al = Math.hypot(ax, ay) || 1;
+      const minD = extents[i].ry * 2 + 10;
+      if (al < minD) {
+        px += (ax / al) * (minD - al) * 3;
+        py += (ay / al) * (minD - al) * 3;
       }
     });
+    r.vx = Math.cos(r.heading) * v + r.dx + px;
+    r.vy = Math.sin(r.heading) * v + r.dy + py;
+    r.x += r.vx * dt;
+    r.y += r.vy * dt;
+    if (r.age > 3 && offScreen(r, DUCK_R * 3) && (r.mode === "cruise" || r.mode === "leave")) r.active = false;
+  };
+  const updateDucks = (dt, t) => {
+    ducks.forEach((d, i) => d.active && (d.chick ? updateChick : d.coon ? updateCoon : updateDuck)(d, i, dt, t));
+    // (Ducks swim even with reduced motion: they're slow and gentle.)
+    nextDuck -= dt;
+    if (nextDuck <= 0) {
+      const i = ducks.findIndex((d) => !d.chick && !d.coon && !d.active);
+      if (i >= 0) spawnDuck(ducks[i], i);
+      // (Crossing time: about the view's mean side plus the margins, at a
+      // duck's average pace.)
+      const cross = ((innerWidth + innerHeight) / 2 + 3 * DUCK_R) / (0.8 * DUCK_SPEED);
+      nextDuck = arrivals++ === 0 ? between(4, 9) : (cross / DUCKS_IDLE) * between(0.7, 1.3);
+    }
+    // Raccoons only come while there are ducklings in view to hunt.
+    nextCoon -= dt;
+    if (nextCoon <= 0) {
+      const i = ducks.findIndex((d) => d.coon && !d.active);
+      const prey = ducks.some((c) => c.active && c.chick && !c.eaten && !offScreen(c, 0));
+      if (i >= 0 && (prey || coonTest)) {
+        spawnCoon(ducks[i], i);
+        nextCoon = between(...RACCOON_EVERY);
+      } else nextCoon = 3;
+    }
+    let n = 0;
     ducks.forEach((d, i) => {
       if (d.active) {
         // (The shaders take ducks in viewport coordinates.)
         duckData[i].set(d.x - scrollX, d.y - scrollY, Math.cos(d.heading), Math.sin(d.heading));
-        duckVel[i].set(d.vx, d.vy, d.bend, 0);
+        duckVel[i].set(d.vx, d.vy, d.bend + (d.wiggle || 0), d.size);
+        // (A swallowed duckling nearly gone no longer pushes anything.)
+        if (d.size > 0.02) duckList[n++].set(i, d.chick ? 1 : d.coon ? 2 : 0, 0, 0);
       } else {
         duckData[i].set(-1e5, -1e5, 1, 0);
-        duckVel[i].set(0, 0, 0, 0);
+        duckVel[i].set(0, 0, 0, 1);
       }
     });
-    if (duckTest) {
+    uDuckCount.value = n;
+    if (duckTest || coonTest) {
       const d = ducks[0];
       window.__duck = { x: d.x - scrollX, y: d.y - scrollY, h: d.heading, dx: d.dx, dy: d.dy };
-      window.__ducks = ducks.map((c) => c.active && { x: c.x - scrollX, y: c.y - scrollY, leader: c.leader, chick: c.chick });
+      window.__ducks = ducks.map((c) => c.active && { x: c.x - scrollX, y: c.y - scrollY, leader: c.leader, chick: c.chick, coon: c.coon, mode: c.mode, size: c.size, eaten: c.eaten, meals: c.meals });
     }
   };
 
