@@ -40,7 +40,11 @@ just behind the test duck's brood, which makes a hunt within seconds; each
 `__ducks` entry then also has coon, mode, size, eaten, meals), `?flytest`
 sends a dragonfly in after 0.5s that keeps looking for pads (each perch's
 state in `window.__flies`, incl. why it last took off; `window.__splash(x,
-y, strength)` makes a splash at a viewport point), `?gputime` turns
+y, strength)` makes a splash at a viewport point), `?frogtest` brings a
+frog up after 0.5s that keeps coming back (`?frogtest=N`: N pads per visit;
+state in `window.__frogs`, incl. why it last fled; `__splash` too; with
+`?frogtest=9&raccoontest=0.3,0.5,0` a raccoon hunts the frogs, and
+`__ducks` entries show what each raccoon's `prey` is), `?gputime` turns
 on GPU timestamp queries and puts `{c, r}` (compute / render ms, every 30
 frames) in `window.__gpu` (splits compute into three submissions), `?seed=N`
 repeats one pond layout (see Lily pads; random per visit otherwise). The
@@ -102,7 +106,8 @@ raccoon); `uDrops` (click splashes: document pos, start time, strength).
 ## Per-frame pipeline (`renderer.setAnimationLoop`)
 
 CPU: dt, scroll, mouse → wake uniforms; smoothed **water cursor**; hover
-easing → `groupBuf`; `updateDucks()`; `updateFlies()`; wave grid anchor /
+easing → `groupBuf`; `updateDucks()`; `updateFlies()`; `updateFrogs()`;
+wave grid anchor /
 substeps. Then one
 `renderer.compute([...])`:
 
@@ -133,9 +138,12 @@ substeps. Then one
    its 8 nearest power bisectors, gathered from the block lists of a 5×5
    grid of blocks 12px apart, stored in `padData` (5 vec4s/pad) as the 6
    nearest edge lines `(normal, offset)` plus the flower's room.
-9. `flyProbe` — one thread per dragonfly: the lily pad under a point it
-   asks about (from `padBlock`) and where a watched pad is and how fast it
-   moves, into `flyOut`, read back to the CPU (see Dragonflies).
+9. `padProbe` — one thread per dragonfly and frog (`PROBES`; dragonflies
+   first): the lily pad under a point it asks about (`uProbeAsk.xy`, from
+   `padBlock`; or `-3` and the point if no leaf covers it at all, i.e. open
+   water or text) and where a watched pad (`uProbeAsk.z`) is and how fast it
+   moves, into `probeOut`, read back to the CPU (`readProbes`; see
+   Dragonflies, Frogs).
 
 Then a full-screen `QuadMesh` with `shade()`:
 - Candidates are **streamed** (`forEachCandidate`, read twice, never stored —
@@ -238,7 +246,8 @@ scattered blobs, not as the pads' clean cells.
 Palettes in `PALETTES.light/dark` (water, pads, petals, ripple, text=cream,
 accent=#ffb82b used for underlines, duck bill, flower centres; duckling
 yellow; raccoon grey `raccoon`, `raccoonDark` and `raccoonPale`; dragonfly
-orange-red `fly`, clear `flyWing`). Colours are
+orange-red `fly`, clear `flyWing`; frog lime `frog` and darker `frogLeg`,
+lifted a little in dark mode so the legs show against dark pads). Colours are
 sRGB values (`outputColorSpace = LinearSRGBColorSpace`, no conversion).
 
 ## Text
@@ -371,6 +380,9 @@ nodes respawn).
 
 Owner asked for raccoons as cute as the ducks that hunt ducklings and
 "absorb" them, which ducks avoid, made to feel natural, fun and satisfying.
+They hunt **frogs** sitting on pads too (`preyAround()`: ducklings, and
+frogs that are `frogExposed`; `r.prey` holds the animal itself), and come
+while either is in view; a caught frog is swallowed like a duckling.
 
 **Look** (`coonCells`, `RACCOON_SCALE=1.8`, ~120 css px long, bigger than a
 duck): a chubby round back; a big head; and a bushy tail of five
@@ -468,10 +480,10 @@ and a hover (0.3–1.3s, bobbing, glancing about). Modes: `dart`, `hover`,
 `approach`, `land`, `perched`, `takeoff`, `leave`.
 
 **Pads.** The CPU can't see pads, so while hovering a dragonfly asks
-`flyProbe` about a random point within ~240px each frame (`uFlyAsk.xy`);
+`padProbe` about a random point within ~240px each frame (`uProbeAsk.xy`);
 answers (a frame or two late) give a pad's id, centre and radius (pads with
 a flower, or not fully grown, are skipped; one already taken by another
-dragonfly too). It darts over the pad (tracking it via `uFlyAsk.z`, the
+dragonfly or a frog too, `padFree`). It darts over the pad (tracking it via `uProbeAsk.z`, the
 watched pad), settles onto a spot within 0.3 of its radius (0.45s: shadow
 draws in, wings slow) with a tiny-drop ripple round the rim, and sits
 `FLY_PERCH` 4–14s. **Disturbed:** after 1.2s (its own ripple settles), it
@@ -487,6 +499,66 @@ Tested: a click 120px away sends it off ~0.55s later (as the ring reaches
 it); one 300px away doesn't; left alone it sits its full time. After 1–3
 pads (or 75s) it sweeps off out of view. Spawning: first after 5–10s, then
 every `FLY_EVERY` 14–32s while a slot is free.
+
+## Frogs (`MAX_FROGS=3`)
+
+Owner asked for frogs that jump out of the water onto lily pads, jump
+between pads and back into the water, jump in when disturbed like the
+dragonflies, get eaten by raccoons, and make ripples in proportion to each
+jump. Then: no eyes (a first take had two eye bumps, and floated with just
+its eyes above water before leaping out; both removed), and a frog should
+only flee a raccoon hunting it once it **notices** it, so the raccoon has a
+chance.
+
+**Look** (`frogMesh`, drawn in the pad pass's scene like the dragonflies,
+before them; SDFs in units of `FROG_SIZE=1.5`px, ~21px long sitting): a
+plump egg of a body (blunt nose a little longer than the rump, so it reads
+as facing somewhere without eyes), two small front legs, and back legs
+(thigh ellipse and foot disc smooth-unioned into one blob) folded at its
+sides; in a leap (`legs` 0→1) they stretch straight out behind and the
+front legs reach forward. Flat colours with the cells' lit rim and thin
+darker edge, a soft shadow down-right that moves out with height, a little
+bigger when high. Coming out of or going into the water (`sub`) the legs
+vanish and the body shows faint and water-tinted. Sitting, the vertex stage
+draws it at its pad's live `siteBuf` position plus its spot. Designed in a
+2D SDF prototype.
+
+**Behaviour** (`updateFrog`, CPU, document px). Modes: `under` (invisible),
+`leap`, `sit`, `seek`, `aim`, `dive`.
+- `under`: after 2–5s (none for a new frog) it looks for somewhere to come
+  out: a free pad under a random point in view, then a spot 14–40px beyond
+  its rim, checked to be open water (`padProbe` answers `-3` for it, matched
+  by position) and not near the words (`textBoxes`, from `layout()`). Then
+  it leaps straight out onto the pad. After 1–2 visits (or 100s) it's gone.
+- `leap`: a straight hop over 0.3–0.6s (`distance / 280px/s`), height
+  `4·H·u(1−u)` with `H = min(0.22·d, 30) + 8`, landing wherever the target
+  pad has drifted to (watched); legs kick out at once and fold as it comes
+  down on a pad.
+- `sit`: rides the pad `FROG_SIT` 3–9s, glancing about, then leaps to a free
+  pad `FROG_REACH` 35–150px away (`padSearch`, after an `aim` turn of
+  ~0.25s); after `FROG_HOPS` 1–4 pads, `seek`.
+- `seek`: finds open water 18–50px beyond its pad's rim (`waterSearch`),
+  aims and leaps in; `dive`: plop, then it fades under in 0.2s.
+**Ripples** (tiny drops, `FROG_RIPPLE`, sized between a dragonfly's 0.1 and
+a click's): a ring of radius 7 where it leaves the water (0.5), round the
+pad's rim when it lands (0.3) or kicks off (0.25), radius 8 where it plops
+in (0.9).
+**Disturbed** like a dragonfly (`ride`: its pad faster than `FROG_SPOOK=18`
+px/s or `FROG_SHIFT=6`px from where it settled, after its own landing ring
+settles in 1.2s, or no longer a pad) it's startled (`panic`): it checks the
+water for at most 0.1s and leaps off at once, no turning first, away from
+the danger.
+**Raccoons**: a frog only flees one hunting it (`r.prey` is the frog), and
+only once it notices: a chance per second `FROG_NOTICE` (stalking 1 × how
+near its mouth is, 0–1 over `RACCOON_NOTICE`; crouched 1; lunging 2.5),
+then a reaction of `FROG_REACT` 0.12–0.3s. It can be caught on its pad
+until it's in the air. Tested with `?frogtest=9&raccoontest`: 5 of 15
+hunts on frogs ended in a catch, mostly frogs that noticed too late, mid-
+lunge (with stalk 0.3 from the raccoon's centre almost none noticed in
+time; before the panic leap was made
+instant, the 0.35s spent checking water and turning meant every hunt
+did). Frogs and dragonflies never share a pad (`padFree`). 120fps headful
+with frogs, dragonflies, ducks and a raccoon.
 
 ## Ripples (wave simulation + mosaic)
 
@@ -560,7 +632,8 @@ blob (cell ∩ disc growing with strength): ripple colours on crests, a faint
   ~47 on screen) still holds 120fps at ~+0.2ms compute.
 - Every extra `renderer.render()` is a full-screen render pass: the
   dragonflies' own pass cost ~2ms GPU at Retina size, inside the pad pass
-  they cost ~nothing. Add new overlays to the pad pass's scene.
+  they cost ~nothing. Add new overlays to the pad pass's scene (the frogs
+  are there too).
 - Fragment shader size matters for every pixel (register pressure / occupancy):
   rarely-taken but big branches (pad + flower code) cost ~1.5ms for all
   pixels; move such work into its own pass.
@@ -609,7 +682,9 @@ behind about half the ducks, separable, swimming back to the nearest duck
 (see Ducklings); more ducks / ducklings that feel unlimited with
 interaction (see Ducks); cute raccoons that hunt and swallow ducklings and
 that ducks avoid (see Raccoons); dragonflies that land on pads with very
-gentle ripples, curved natural flight, simple style (see Dragonflies).
+gentle ripples, curved natural flight, simple style (see Dragonflies);
+frogs that leap between the water and pads with proportional ripples, flee
+when disturbed, can be eaten, no eyes (see Frogs).
 Liked: blobby rounded ripple cells, V wakes (esp. duck wakes and fast cursor
 strokes), clustered pads, Voronoi-cell pads (some bigger, a little Voronoi
 irregularity is fine; veins, lit rim), flowers, ducks parting pads, ducks drawn in the pad style, letters with the same lit

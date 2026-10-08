@@ -166,6 +166,24 @@ const FLY_SPOOK = 16; // css px/s: a pad moving this fast sends it off
 const FLY_SHIFT = 5; // css px: ...or moved this far since it landed
 const FLY_ALT = 24; // css px it flies above the water (sets its shadow)
 const FLY_SIZE = 1.3; // (its shapes are drawn in units of this many css px)
+const MAX_FROGS = 3;
+const FROG_EVERY = [10, 26]; // s between frogs surfacing (the first after 6-12 s)
+const FROG_SIT = [3, 9]; // s it sits on a pad before hopping on
+const FROG_HOPS = [1, 4]; // pads it visits before diving back in
+const FROG_REACH = [35, 150]; // css px it'll leap from pad to pad
+const FROG_SIZE = 1.5; // (its shapes are drawn in units of this many css px: ~21px long sitting)
+const FROG_SPOOK = 18; // css px/s: its pad moving this fast sends it into the water
+const FROG_SHIFT = 6; // css px: ...or moved this far since it landed
+// How readily a frog notices a raccoon hunting it (chance per second): a
+// stalking one, more the closer it creeps (x closeness, 0-1); one crouched
+// to pounce; one lunging. Noticed, it reacts after FROG_REACT s and leaps
+// into the water, so a raccoon often (not always) catches one.
+const FROG_NOTICE = { stalk: 1, crouch: 1, lunge: 2.5 };
+const FROG_REACT = [0.12, 0.3];
+// The ripples its leaps make (tiny drops, see TINY_DROP; amount < 1),
+// sized to it: bigger than a dragonfly's, far smaller than a click's.
+const FROG_RIPPLE = { out: 0.5, onPad: 0.3, offPad: 0.25, plop: 0.9 };
+const PROBES = MAX_FLIES + MAX_FROGS; // (padProbe threads: dragonflies, then frogs)
 const DUCKLING_FEAR = 115; // css px: ducklings flee a raccoon this close
 const DUCK_WARY = 170; // css px: ducks turn away from a raccoon this close
 const BROOD_CHANCE = 0.5;
@@ -289,6 +307,8 @@ const PALETTES = {
     raccoonPale: "#efe9de",
     fly: "#ec5b2c",
     flyWing: "#f1f7ff",
+    frog: "#8fc24a",
+    frogLeg: "#74a83c",
   },
   dark: {
     water: "#0f3149",
@@ -310,6 +330,8 @@ const PALETTES = {
     raccoonPale: "#ddd6c9",
     fly: "#d9552d",
     flyWing: "#d6e4f0",
+    frog: "#88bd48",
+    frogLeg: "#6ea43c",
   },
 };
 
@@ -438,15 +460,28 @@ async function main() {
   const flyB = Array.from({ length: MAX_FLIES }, () => new THREE.Vector4(-1, 0, 0, -1));
   const uFlyA = uniformArray(flyA, "vec4");
   const uFlyB = uniformArray(flyB, "vec4");
-  // What each dragonfly asks the GPU about pads (see flyProbe): xy a
-  // viewport point to look for a pad under (off screen = none), z a pad to
-  // watch (node id, -1 = none).
-  const flyAsk = Array.from({ length: MAX_FLIES }, () => new THREE.Vector4(-1e5, -1e5, -1, 0));
-  const uFlyAsk = uniformArray(flyAsk, "vec4");
-  // ...and its answers, read back to the CPU: [2i] the pad found under the
-  // point (id or -1, document xy, radius), [2i+1] the watched pad (document
-  // xy, speed, its id, or -2 if it's no longer a pad, -1 if none asked).
-  const flyOut = instancedArray(MAX_FLIES * 2, "vec4");
+  // Frogs (one entry per slot). A: viewport xy, heading, height in a leap
+  // (css px). B: x the pad it's sitting on (node id, -1 = none), yz its
+  // spot on it, w 1 (-1 = slot unused). C: x legs (0 folded, 1 stretched
+  // out in a leap), y how far in the water (coming out or going in), z how
+  // visible (0 gone under), w size (shrinks when eaten).
+  const frogA = Array.from({ length: MAX_FROGS }, () => new THREE.Vector4());
+  const frogB = Array.from({ length: MAX_FROGS }, () => new THREE.Vector4(-1, 0, 0, -1));
+  const frogC = Array.from({ length: MAX_FROGS }, () => new THREE.Vector4(0, 0, 0, 1));
+  const uFrogA = uniformArray(frogA, "vec4");
+  const uFrogB = uniformArray(frogB, "vec4");
+  const uFrogC = uniformArray(frogC, "vec4");
+  // What each dragonfly and frog asks the GPU (see padProbe; dragonflies
+  // first, then frogs): xy a viewport point to look for a pad under (off
+  // screen = none), z a pad to watch (node id, -1 = none).
+  const probeAsk = Array.from({ length: PROBES }, () => new THREE.Vector4(-1e5, -1e5, -1, 0));
+  const uProbeAsk = uniformArray(probeAsk, "vec4");
+  // The answers, read back to the CPU: [2i] the pad found under the point
+  // (id, document xy, radius; -3 and the point's document xy if there's no
+  // leaf there at all, i.e. open water or text; else -1), [2i+1] the
+  // watched pad (document xy, speed, its id, or -2 if it's no longer a pad,
+  // -1 if none asked).
+  const probeOut = instancedArray(PROBES * 2, "vec4");
   // Wave grid (viewport-sized, anchored to the document so waves scroll
   // with the page): size, the document position of cell (0,0)'s corner, how
   // many cells the anchor moved since last frame, the per-substep timestep
@@ -494,6 +529,8 @@ async function main() {
     raccoonPale: uRaccoonPale,
     fly: uFly,
     flyWing: uFlyWing,
+    frog: uFrog,
+    frogLeg: uFrogLeg,
   } = palette;
 
   const applyPalette = () => {
@@ -1333,13 +1370,14 @@ async function main() {
       });
     })().compute(MAX_NODES);
 
-    // Dragonflies' questions about pads (see uFlyAsk): the lily pad under a
-    // point, if any (one with no flower, fully grown: its id, centre and
-    // radius), and where a watched pad is now and how fast it's moving.
+    // Dragonflies' and frogs' questions (see uProbeAsk): the lily pad under
+    // a point, if any (one with no flower, fully grown: its id, centre and
+    // radius; or whether there's no leaf there at all), and where a watched
+    // pad is now and how fast it's moving.
     const padBlockRO = ro(padBlock, "uint", blockCap);
-    const flyProbe = Fn(() => {
+    const padProbe = Fn(() => {
       const i = int(instanceIndex);
-      const ask = uFlyAsk.element(i);
+      const ask = uProbeAsk.element(i);
       const bx = int(floor(ask.x));
       const by = int(floor(ask.y));
       const found = vec4(-1, 0, 0, 0).toVar();
@@ -1353,9 +1391,11 @@ async function main() {
           If(floor(look.x).equal(1).and(flower.not()).and(site.w.greaterThan(0.95)), () => {
             found.assign(vec4(float(id), site.xy, look.y.mul(site.w)));
           });
+        }).Else(() => {
+          found.assign(vec4(-3, ask.xy.add(uScroll), 0));
         });
       });
-      flyOut.element(i.mul(2)).assign(found);
+      probeOut.element(i.mul(2)).assign(found);
       const watched = vec4(0, 0, 0, -1).toVar();
       const w = int(ask.z);
       If(w.greaterThanEqual(0), () => {
@@ -1363,15 +1403,15 @@ async function main() {
         const ok = floor(lookBuf.element(w).x).equal(1);
         watched.assign(vec4(site.xy, length(posBuf.element(w).zw), select(ok, float(w), float(-2))));
       });
-      flyOut.element(i.mul(2).add(1)).assign(watched);
-    })().compute(MAX_FLIES);
+      probeOut.element(i.mul(2).add(1)).assign(watched);
+    })().compute(PROBES);
 
     const material = new THREE.MeshBasicNodeMaterial();
     material.colorNode = shade(ro(nbr, "ivec4", blockCap), ro(slots, "int", capacity * SLOTS), ro(padBlock, "uint", blockCap));
 
     const pads = padShader(ro(padData, "vec4", MAX_NODES * 5));
 
-    return { capacity, clear, seed, padScatter, passes, neighbours, padEdgePass, flyProbe, pads, quad: new THREE.QuadMesh(material) };
+    return { capacity, clear, seed, padScatter, passes, neighbours, padEdgePass, padProbe, pads, quad: new THREE.QuadMesh(material) };
   };
 
 
@@ -1668,7 +1708,124 @@ async function main() {
     geometry.instanceCount = MAX_FLIES;
     const mesh = new THREE.Mesh(geometry, material);
     mesh.frustumCulled = false;
-    mesh.renderOrder = 1; // (after the pads)
+    mesh.renderOrder = 2; // (after the pads and frogs)
+    mesh.visible = false;
+    return mesh;
+  })();
+
+  // ------------------------------------------------------- render: frogs
+
+  // A frog, top-down, in the same flat-blob style: a plump egg of a body
+  // (its blunt nose a little longer than its rump), small front legs, and
+  // back legs (thigh and foot one blob) folded at its sides that stretch
+  // out behind in a leap, each piece with the cells' lit rim (top left) and
+  // thin darker edge. No eyes (the owner wants plain blobs). Coming out of
+  // or going into the water it shows faint and water-tinted. Its shadow
+  // falls down-right, further the higher it leaps. Drawn in the lily pad
+  // pass (see flyMesh), riding its pad's live position when sitting.
+  const frogMesh = (() => {
+    const material = new THREE.MeshBasicNodeMaterial({ transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide });
+    const A = uFrogA.element(instanceIndex);
+    const B = uFrogB.element(instanceIndex);
+    const C = uFrogC.element(instanceIndex);
+    const pad = siteRO.element(max(int(B.x), int(0)));
+    const at = select(B.x.greaterThanEqual(0), pad.xy.sub(uScroll).add(B.yz), A.xy);
+    const reach = A.w.mul(0.008).add(1).mul(FROG_SIZE * 20).add(A.w.mul(0.6)).add(4);
+    const corner = at.add(positionGeometry.xy.mul(reach));
+    material.vertexNode = select(
+      B.w.greaterThanEqual(0).and(C.z.greaterThan(0.002)),
+      vec4(corner.x.div(float(uW)).mul(2).sub(1), float(1).sub(corner.y.div(float(uH)).mul(2)), 0, 1),
+      vec4(2, 2, 2, 1), // (unused slot or gone under: off screen)
+    );
+    const vRel = varying(positionGeometry.xy.mul(reach));
+    const vFrog = varying(vec4(A.z, A.w, C.x, C.y)); // heading, height, legs, in the water
+    const vFrog2 = varying(vec2(C.z, C.w)); // visible, size
+    material.colorNode = Fn(() => {
+      const alt = vFrog.y;
+      const legs = vFrog.z;
+      const sub = vFrog.w;
+      const hx = cos(vFrog.x);
+      const hy = sin(vFrog.x);
+      const aa = float(0.7).div(uDpr);
+      // (A little bigger the higher it leaps.)
+      const g = alt.mul(0.008).add(1).mul(FROG_SIZE).mul(max(vFrog2.y, 0.05));
+      // Screen offset -> its own frame: x forward, y to its right.
+      const toLocal = (q) => vec2(dot(q, vec2(hx, hy)), dot(q, vec2(hy.negate(), hx))).div(g);
+      const light = vec2(dot(vec2(-0.6, -0.8), vec2(hx, hy)), dot(vec2(-0.6, -0.8), vec2(hy.negate(), hx)));
+      // Pieces: distance and outward direction (for the rim light).
+      const disc = (q, c, r) => ({ d: length(q.sub(c)).sub(r), n: normalize(q.sub(c).add(vec2(1e-4, 0))) });
+      // (Ellipses: iq's distance approximation; u its long axis.)
+      const oval = (q, c, ang, L, W) => {
+        const u = vec2(cos(ang), sin(ang));
+        const v = vec2(u.y.negate(), u.x);
+        const d = q.sub(c);
+        const p = vec2(dot(d, u), dot(d, v));
+        const r = vec2(L, W);
+        const k0 = length(p.div(r));
+        const m = p.div(r.mul(r));
+        const nl = normalize(m.add(vec2(1e-4, 0)));
+        return { d: k0.mul(k0.sub(1)).div(max(length(m), 1e-4)), n: u.mul(nl.x).add(v.mul(nl.y)) };
+      };
+      // (Its body: an egg, rounder in front.)
+      const egg = (q, cx, front, back, W) => {
+        const p = vec2(q.x.sub(cx), q.y);
+        const r = vec2(select(p.x.greaterThan(0), float(front), float(back)), W);
+        const k0 = length(p.div(r));
+        const m = p.div(r.mul(r));
+        return { d: k0.mul(k0.sub(1)).div(max(length(m), 1e-4)), n: normalize(m.add(vec2(1e-4, 0))) };
+      };
+      const smooth = (a, b, k) => {
+        const h = clamp(b.d.sub(a.d).div(k).mul(0.5).add(0.5), 0, 1);
+        return { d: mix(b.d, a.d, h).sub(h.mul(float(1).sub(h)).mul(k)), n: normalize(mix(b.n, a.n, h)) };
+      };
+      const lerp = (a, b) => mix(float(a), float(b), legs);
+      const pieces = (q) => [
+        ...[-1, 1].flatMap((s) => [
+          // Back leg (thigh and foot as one blob): folded at its side, or
+          // stretched out behind.
+          {
+            ...smooth(oval(q, vec2(lerp(-4, -10), lerp(6, 3.8).mul(s)), lerp(0.8, 0.08).mul(s), lerp(4.4, 6.2), lerp(2.3, 1.8)), disc(q, vec2(lerp(-7.4, -16), lerp(8.2, 4.8).mul(s)), 2), 1.6),
+            col: vec3(uFrogLeg),
+            leg: true,
+          },
+          // Front leg.
+          { ...oval(q, vec2(lerp(3.2, 5.5), lerp(5.5, 3.6).mul(s)), lerp(-0.7, -0.15).mul(s), 2.5, 1.35), col: vec3(uFrogLeg), leg: true },
+        ]),
+        { ...egg(q, -0.5, 7.2, 6, 5.8), col: vec3(uFrog) },
+      ];
+
+      const pc = vec3(0).toVar(); // (premultiplied)
+      const a = float(0).toVar();
+      const over = (col, al) => {
+        pc.assign(col.mul(al).add(pc.mul(float(1).sub(al))));
+        a.assign(al.add(a.mul(float(1).sub(al))));
+      };
+
+      // Shadow (not under water).
+      const blur = alt.mul(0.05).add(0.5);
+      const sq = toLocal(vRel.sub(vec2(0.45, 0.75).mul(alt.mul(0.5).add(1.4))));
+      const shadow = pieces(sq).map((p) => p.d).reduce((x, y) => min(x, y));
+      over(vec3(0.02, 0.08, 0.14), float(1).sub(smoothstep(blur.negate(), blur, shadow)).mul(0.24).mul(float(1).sub(sub)));
+
+      const q = toLocal(vRel).toVar();
+      for (const p of pieces(q)) {
+        const facing = dot(p.n, light);
+        const rim = smoothstep(-2.2, -0.5, p.d);
+        const col = mix(p.col, select(facing.greaterThan(0), mix(p.col, vec3(1), 0.45), p.col.mul(0.8)), rim.mul(abs(facing)).mul(0.5)).toVar();
+        col.assign(mix(col, p.col.mul(0.72), smoothstep(-0.8, 0, p.d)));
+        // In the water: legs hidden, the body a faint, water-tinted shape.
+        const under = p.leg ? float(1).sub(sub) : float(1).sub(sub.mul(0.7));
+        col.assign(mix(col, vec3(uWater), sub.mul(0.4)));
+        over(col, float(1).sub(smoothstep(aa.negate(), aa, p.d)).mul(under));
+      }
+
+      return vec4(pc.div(max(a, 1e-4)), a.mul(vFrog2.x));
+    })();
+    const geometry = new THREE.InstancedBufferGeometry().copy(new THREE.PlaneGeometry(2, 2));
+    geometry.instanceCount = MAX_FROGS;
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 1; // (after the pads; dragonflies fly over it)
     mesh.visible = false;
     return mesh;
   })();
@@ -1995,10 +2152,12 @@ async function main() {
 
   let nodeCount = 0;
   let layoutGen = 0; // (bumped by every layout: node ids change)
+  let textBoxes = []; // (document boxes around each word group: frogs don't dive onto words)
   let firstLayout = true;
 
   const layout = () => {
     const rand = mulberry32(1337 + POND_SEED);
+    textBoxes = [];
     const sx = scrollX;
     const sy = scrollY;
     const docW = Math.max(document.documentElement.scrollWidth, innerWidth);
@@ -2057,6 +2216,7 @@ async function main() {
         r = Math.max(r, c.r);
         b = Math.max(b, c.b);
       }
+      textBoxes.push({ l, t, r, b });
       l = Math.floor(l - pad);
       t = Math.floor(t - pad);
       r = Math.ceil(r + pad);
@@ -2248,7 +2408,7 @@ async function main() {
         return;
       }
       pixelStage = buildPixelStage(Math.min(Math.ceil(Math.max(w * h, screen.width * screen.height) * 1.05), maxCells));
-      pixelStage.pads.scene.add(flyMesh); // (dragonflies ride in the pad pass)
+      pixelStage.pads.scene.add(frogMesh, flyMesh); // (frogs and dragonflies ride in the pad pass)
       pixelStage.seed.count = pixelStage.padEdgePass.count = pixelStage.padScatter.count = nodeCount;
     }
     uNW.value = Math.ceil(w / 2);
@@ -2718,7 +2878,7 @@ async function main() {
       mode: "cruise",
       modeT: 0,
       rest: 2, // s before it starts hunting
-      prey: -1,
+      prey: null, // (a duckling or a frog)
       hunt: 0, // s spent on this hunt
       meals: 0,
       size: 1,
@@ -2729,6 +2889,9 @@ async function main() {
       Object.assign(r, { x: scrollX + innerWidth * fx, y: scrollY + innerHeight * fy, base: fh, heading: fh, age: 3, rest: 0.5 });
     }
   };
+  // What a raccoon can catch: ducklings, and frogs out in the open (not
+  // mid-leap or under water).
+  const preyAround = () => [...ducks.filter((c) => c.active && c.chick && !c.eaten), ...frogs.filter(frogExposed)];
   const updateCoon = (r, i, dt, t) => {
     r.age += dt;
     r.modeT += dt;
@@ -2741,31 +2904,31 @@ async function main() {
     const drift = waveDrift(r, i, DUCK_WAVE_PUSH * 0.6, 120, 2.6, dt);
     if (drift > 28 && r.mode !== "munch" && r.mode !== "leave") {
       if (r.mode !== "cruise") set("cruise");
-      r.prey = -1;
+      r.prey = null;
       r.rest = Math.max(r.rest, 4);
       r.base += angleTo(Math.atan2(r.dy, r.dx), r.base) * (1 - Math.exp(-dt * 2));
     }
     const mx = r.x + Math.cos(r.heading) * COON_MOUTH * r.size;
     const my = r.y + Math.sin(r.heading) * COON_MOUTH * r.size;
-    const P = r.prey >= 0 ? ducks[r.prey] : null;
-    const preyOk = P && P.active && !P.eaten;
+    const P = r.prey;
+    const preyOk = P && P.active && !P.eaten && (!P.frog || frogExposed(P));
     const preyDist = preyOk ? Math.hypot(P.x - mx, P.y - my) : Infinity;
     let speed = RACCOON_SPEED; // (x DUCK_SPEED)
     let turn = 1.5; // how fast it turns to its heading (1/s)
     let sniff = 1; // how much it weaves
     if (r.mode === "cruise") {
       if (r.rest <= 0 && r.meals < RACCOON_FULL) {
-        let best = -1;
+        let best = null;
         let bd = RACCOON_NOTICE;
-        ducks.forEach((c, j) => {
-          if (!c.active || !c.chick || c.eaten || offScreen(c, -10)) return;
+        for (const c of preyAround()) {
+          if (offScreen(c, -10)) continue;
           const dd = Math.hypot(c.x - mx, c.y - my);
           if (dd < bd) {
             bd = dd;
-            best = j;
+            best = c;
           }
-        });
-        if (best >= 0) {
+        }
+        if (best) {
           r.prey = best;
           r.hunt = 0;
           set("stalk");
@@ -2775,7 +2938,7 @@ async function main() {
       r.hunt += dt;
       if (!preyOk || preyDist > RACCOON_NOTICE * 1.5 || r.hunt > 15) {
         // Gave up.
-        r.prey = -1;
+        r.prey = null;
         r.rest = between(3, 6);
         set("cruise");
       } else {
@@ -2799,23 +2962,23 @@ async function main() {
       turn = 2.5;
       sniff = 0;
       if (preyOk) r.base = Math.atan2(P.y - my, P.x - mx);
-      let caught = -1;
+      let caught = null;
       let cd = RACCOON_CATCH * r.size;
-      ducks.forEach((c, j) => {
-        if (!c.active || !c.chick || c.eaten) return;
+      for (const c of preyAround()) {
         const dd = Math.hypot(c.x - mx, c.y - my);
         if (dd < cd) {
           cd = dd;
-          caught = j;
+          caught = c;
         }
-      });
-      if (caught >= 0) {
-        const c = ducks[caught];
-        loseLine(c, caught);
+      }
+      if (caught) {
+        const c = caught;
+        if (c.frog) Object.assign(c, { pad: -1, goal: -1, alt: 0 });
+        else loseLine(c, ducks.indexOf(c));
         Object.assign(c, { eaten: 1e-3, by: i, size: 0.97 });
         splash(mx, my, 0.15);
         r.meals++;
-        r.prey = -1;
+        r.prey = null;
         set("munch");
       } else if (r.modeT > 0.5) set("recover");
     } else if (r.mode === "recover") {
@@ -2893,11 +3056,11 @@ async function main() {
       const cross = ((innerWidth + innerHeight) / 2 + 3 * DUCK_R) / (0.8 * DUCK_SPEED);
       nextDuck = arrivals++ === 0 ? between(4, 9) : (cross / DUCKS_IDLE) * between(0.7, 1.3);
     }
-    // Raccoons only come while there are ducklings in view to hunt.
+    // Raccoons only come while there are ducklings or frogs in view to hunt.
     nextCoon -= dt;
     if (nextCoon <= 0) {
       const i = ducks.findIndex((d) => d.coon && !d.active);
-      const prey = ducks.some((c) => c.active && c.chick && !c.eaten && !offScreen(c, 0));
+      const prey = preyAround().some((c) => !offScreen(c, 0));
       if (i >= 0 && (prey || coonTest)) {
         spawnCoon(ducks[i], i);
         nextCoon = between(...RACCOON_EVERY);
@@ -2920,7 +3083,7 @@ async function main() {
     if (duckTest || coonTest) {
       const d = ducks[0];
       window.__duck = { x: d.x - scrollX, y: d.y - scrollY, h: d.heading, dx: d.dx, dy: d.dy };
-      window.__ducks = ducks.map((c) => c.active && { x: c.x - scrollX, y: c.y - scrollY, leader: c.leader, chick: c.chick, coon: c.coon, mode: c.mode, size: c.size, eaten: c.eaten, meals: c.meals });
+      window.__ducks = ducks.map((c) => c.active && { x: c.x - scrollX, y: c.y - scrollY, leader: c.leader, chick: c.chick, coon: c.coon, mode: c.mode, size: c.size, eaten: c.eaten, meals: c.meals, prey: c.prey ? (c.prey.frog ? "frog" : "duckling") : null });
     }
   };
 
@@ -2929,34 +3092,39 @@ async function main() {
   // (See MAX_FLIES.) Each comes in from an edge and darts about: a quick
   // spring to a point, a dead stop, a hover (bobbing, glancing about), the
   // next dart. While hovering it looks for a lily pad, asking the GPU what's
-  // under random points nearby (flyProbe; answers arrive a frame or two
+  // under random points nearby (padProbe; answers arrive a frame or two
   // later); given a free one it darts over it, settles onto it (wings
   // slowing, shadow drawing in) with a small ripple and sits FLY_PERCH s,
-  // riding the pad. It watches the pad (flyProbe again) and is off at once,
+  // riding the pad. It watches the pad (padProbe again) and is off at once,
   // with another ripple, if the pad moves faster than FLY_SPOOK or drifts
   // FLY_SHIFT from where it settled (a ripple, a duck shoving it, the
   // cursor's wake) or stops being a pad (relayout). After 1-3 pads it leaves.
   const flyTest = params.has("flytest");
   if (flyTest) window.__splash = (x, y, w) => splash(x + scrollX, y + scrollY, w);
   const flies = Array.from({ length: MAX_FLIES }, () => ({ active: false }));
+  // A pad no dragonfly or frog (but `me`) is on or heading for.
+  const padFree = (id, me) =>
+    !flies.some((o) => o !== me && o.active && (o.pad === id || o.target === id)) && !frogs.some((o) => o !== me && o.active && !o.eaten && (o.pad === id || o.goal === id));
   let nextFly = flyTest ? 0.5 : between(5, 10);
-  let flyBusy = false;
-  const readFlies = () => {
-    if (flyBusy) return;
-    flyBusy = true;
+  // (padProbe's answers, for dragonflies and frogs alike.)
+  let probeBusy = false;
+  const readProbes = () => {
+    if (probeBusy) return;
+    probeBusy = true;
     renderer
-      .getArrayBufferAsync(flyOut.value)
+      .getArrayBufferAsync(probeOut.value)
       .then((ab) => {
         const o = new Float32Array(ab);
         const now = performance.now();
-        flies.forEach((f, i) => {
+        [...flies, ...frogs].forEach((f, i) => {
           if (!f.active) return;
           const k = i * 8;
           if (o[k] >= 0 && f.looking) f.found = { id: o[k], x: o[k + 1], y: o[k + 2], r: o[k + 3], t: now, gen: layoutGen };
+          if (o[k] === -3) f.open = { x: o[k + 1], y: o[k + 2], t: now };
           f.watch = { x: o[k + 4], y: o[k + 5], speed: o[k + 6], id: o[k + 7] };
         });
       })
-      .finally(() => (flyBusy = false));
+      .finally(() => (probeBusy = false));
   };
   // A dart from where it is to (tx, ty) at about `speed` px/s. Real
   // dragonflies fly direct but not ruler-straight: each dart bows into a
@@ -3116,7 +3284,7 @@ async function main() {
       }
       if (f.modeT > f.hoverFor) {
         const p = f.found;
-        const fresh = p && wants && performance.now() - p.t < 800 && p.gen === layoutGen && !flies.some((o) => o !== f && o.active && (o.pad === p.id || o.target === p.id));
+        const fresh = p && wants && performance.now() - p.t < 800 && p.gen === layoutGen && padFree(p.id, f);
         if (fresh) {
           // Settle a little off the pad's centre.
           const a = Math.random() * Math.PI * 2;
@@ -3194,7 +3362,7 @@ async function main() {
       faceMotion(f, dt);
       if (f.age > 2 && offScreen(f, 80)) f.active = false;
     }
-    flyAsk[i].set(probe ? probe[0] : -1e5, probe ? probe[1] : -1e5, ask, 0);
+    probeAsk[i].set(probe ? probe[0] : -1e5, probe ? probe[1] : -1e5, ask, 0);
   };
   const updateFlies = (dt, t) => {
     nextFly -= dt;
@@ -3207,7 +3375,7 @@ async function main() {
       if (f.active) updateFly(f, i, dt, t);
       if (!f.active) {
         flyB[i].set(-1, 0, 0, -1);
-        flyAsk[i].set(-1e5, -1e5, -1, 0);
+        probeAsk[i].set(-1e5, -1e5, -1, 0);
         return;
       }
       // (A hovering one bobs a little.)
@@ -3217,6 +3385,407 @@ async function main() {
       flyB[i].set(f.mode === "perched" ? f.pad : -1, f.ox, f.oy, flap);
     });
     if (flyTest) window.__flies = flies.map((f) => f.active && { x: f.x - scrollX, y: f.y - scrollY, mode: f.mode, pad: f.pad, target: f.target, perches: f.perches, why: f.why, watch: f.watch && { ...f.watch }, base: f.base && { ...f.base } });
+  };
+
+  // ------------------------------------------------------------------ frogs
+
+  // (See MAX_FROGS.) A frog leaps up out of the water (from open water just
+  // beyond a lily pad's rim) onto the pad. It sits a while, riding the pad,
+  // leaps on to nearby pads (FROG_HOPS), then leaps back into the water
+  // with a plop and is gone; it may come out again somewhere else a few
+  // seconds later. Every leap makes a ripple sized to it (FROG_RIPPLE): a
+  // ring where it leaves the water, one round the pad's rim when it lands on
+  // or kicks off a pad, a bigger one where it plops in. Disturbed like the
+  // dragonflies (its pad shoved or rocked by a wave) it's off into the
+  // water at once. Raccoons hunt frogs as well as ducklings; a frog flees a
+  // raccoon hunting it only once it notices (see FROG_NOTICE), so some
+  // hunts end in a catch.
+  //
+  // The CPU can't see pads or water, so like a dragonfly a frog asks
+  // padProbe: about pads under random points nearby, whether a spot is open
+  // water (no leaf there; words are ruled out here, from textBoxes) and how
+  // its pad is moving.
+  const frogTest = params.has("frogtest");
+  if (frogTest) window.__splash = (x, y, w) => splash(x + scrollX, y + scrollY, w);
+  const frogs = Array.from({ length: MAX_FROGS }, () => ({ active: false, frog: true }));
+  let nextFrog = frogTest ? 0.5 : between(6, 12);
+  const inText = (x, y, m) => textBoxes.some((b) => x > b.l - m && x < b.r + m && y > b.t - m && y < b.b + m);
+  const inView = (x, y, m) => x > scrollX + m && x < scrollX + innerWidth - m && y > scrollY + m && y < scrollY + innerHeight - m;
+  // (A ring of this radius: a tiny drop, see TINY_DROP.)
+  const ring = (x, y, radius, amount) => splash(x, y, -(Math.max(1, Math.round(radius)) + Math.min(amount, 0.99)));
+  // Sitting on a pad, where a raccoon can catch it (not mid-leap or under
+  // water).
+  const frogExposed = (f) => f.active && !f.eaten && f.pad >= 0 && (f.mode === "sit" || f.mode === "seek" || f.mode === "aim");
+  const setFrog = (f, mode) => {
+    f.mode = mode;
+    f.modeT = 0;
+  };
+  const spawnFrog = (f) => {
+    Object.assign(f, {
+      active: true,
+      age: 0,
+      x: -1e5,
+      y: -1e5,
+      px: -1e5,
+      py: -1e5,
+      vx: 0,
+      vy: 0,
+      heading: Math.random() * Math.PI * 2,
+      alt: 0,
+      legs: 0,
+      sub: 1,
+      vis: 0,
+      size: 1,
+      mode: "under",
+      modeT: 0,
+      underFor: 0,
+      pad: -1, // the pad it's sitting on
+      goal: -1, // the pad it's going for
+      ox: 0, // its spot on the pad
+      oy: 0,
+      padR: 0,
+      landT: 0,
+      hops: 0,
+      maxHops: 0,
+      laps: 0,
+      maxLaps: frogTest ? 9 : 1 + Math.floor(Math.random() * 2),
+      found: null,
+      open: null,
+      watch: null,
+      cand: null,
+      next: null,
+      looking: false,
+      eaten: 0,
+      by: -1,
+      react: -1, // s until it reacts to a raccoon it has noticed (-1: none)
+      flee: null,
+      panic: false,
+      phase: Math.random() * 100,
+    });
+  };
+  // (?frogtest=N: N pads per visit.)
+  const rollHops = (f) => (f.maxHops = frogTest ? +params.get("frogtest") || 6 : FROG_HOPS[0] + Math.floor(Math.random() * (FROG_HOPS[1] - FROG_HOPS[0] + 1)));
+  // Checking a spot is open water: ask about it, and wait for the answer
+  // (matched by position). Returns "ok", the point to ask about, or null
+  // once it turned out not to be water.
+  const checkOpen = (f, now) => {
+    const c = f.cand;
+    const o = f.open;
+    if (o && o.t > c.t && Math.hypot(o.x - c.x, o.y - c.y) < 1.5) return "ok";
+    if (now - c.t > 250) return null;
+    return [c.x - scrollX, c.y - scrollY];
+  };
+  // Where to come out: open water just beyond a free pad's rim, in view and
+  // clear of the words. (It looks for pads under random points in view,
+  // then checks the water beside one.)
+  const surfaceSearch = (f, now) => {
+    if (f.cand) {
+      const r = checkOpen(f, now);
+      if (r) return r;
+      f.cand = null;
+    }
+    const p = f.found;
+    f.found = null;
+    if (p && now - p.t < 500 && p.gen === layoutGen && padFree(p.id, f) && inView(p.x, p.y, 50)) {
+      const a = Math.random() * Math.PI * 2;
+      const d = p.r + between(14, 40);
+      const x = p.x + Math.cos(a) * d;
+      const y = p.y + Math.sin(a) * d;
+      if (inView(x, y, 30) && !inText(x, y, 16)) {
+        f.cand = { x, y, t: now, pad: p };
+        return [x - scrollX, y - scrollY];
+      }
+    }
+    f.looking = true;
+    return [between(60, innerWidth - 60), between(60, innerHeight - 60)];
+  };
+  // Where to leap in from its pad: open water a little beyond the rim (away
+  // from the danger if it's fleeing), in view and clear of the words.
+  const waterSearch = (f, now) => {
+    if (f.cand) {
+      const r = checkOpen(f, now);
+      if (r) return r;
+      f.cand = null;
+    }
+    const cx = f.x - f.ox;
+    const cy = f.y - f.oy;
+    for (let k = 0; k < 6; k++) {
+      const a = f.flee !== null ? f.flee + between(-0.8, 0.8) : Math.random() * Math.PI * 2;
+      const d = f.padR + between(18, 50);
+      const x = cx + Math.cos(a) * d;
+      const y = cy + Math.sin(a) * d;
+      if (inView(x, y, 20) && !inText(x, y, 14)) {
+        f.cand = { x, y, t: now };
+        return [x - scrollX, y - scrollY];
+      }
+    }
+    return null;
+  };
+  // A free pad within leaping reach (from the GPU's answers), or the next
+  // point to ask about.
+  const padSearch = (f, now) => {
+    const p = f.found;
+    f.found = null;
+    if (p && now - p.t < 500 && p.gen === layoutGen && p.id !== f.pad && padFree(p.id, f) && inView(p.x, p.y, 30)) {
+      const d = Math.hypot(p.x - f.x, p.y - f.y);
+      if (d > FROG_REACH[0] && d < FROG_REACH[1] + p.r) return { pad: p };
+    }
+    f.looking = true;
+    const a = Math.random() * Math.PI * 2;
+    const d = between(...FROG_REACH);
+    return { probe: [f.x + Math.cos(a) * d - scrollX, f.y + Math.sin(a) * d - scrollY] };
+  };
+  // Turn to face where it's going (aim), then leap.
+  const aimAt = (f, x, y, onto, padR = 0, ox = 0, oy = 0) => {
+    f.next = { x, y, onto, padR, ox, oy };
+    f.goal = onto;
+    setFrog(f, "aim");
+  };
+  const aimAtPad = (f, p) => {
+    // (Somewhere near the middle of it.)
+    const a = Math.random() * Math.PI * 2;
+    const rr = p.r * 0.25 * Math.random();
+    aimAt(f, p.x + Math.cos(a) * rr, p.y + Math.sin(a) * rr, p.id, p.r, Math.cos(a) * rr, Math.sin(a) * rr);
+  };
+  const leap = (f) => {
+    const n = f.next;
+    // (The ripple it kicks off with.)
+    if (f.pad >= 0) ring(f.x - f.ox, f.y - f.oy, f.padR * 0.9, FROG_RIPPLE.offPad);
+    else ring(f.x, f.y, 7, FROG_RIPPLE.out);
+    const d = Math.hypot(n.x - f.x, n.y - f.y);
+    Object.assign(f, {
+      sx: f.x,
+      sy: f.y,
+      tx: n.x,
+      ty: n.y,
+      onto: n.onto,
+      leapFor: Math.min(Math.max(d / 280, 0.3), 0.6),
+      leapH: Math.min(d * 0.22, 30) + 8,
+      fromWater: f.pad < 0,
+      pad: -1,
+      heading: Math.atan2(n.y - f.y, n.x - f.x),
+    });
+    if (n.onto >= 0) Object.assign(f, { ox: n.ox, oy: n.oy, padR: n.padR });
+    setFrog(f, "leap");
+  };
+  // Startled: it leaps off its pad into the water (away from the danger),
+  // quick.
+  const startle = (f, why, away = null) => {
+    f.react = -1;
+    f.why = why;
+    Object.assign(f, { flee: away, panic: true, cand: null, goal: -1 });
+    setFrog(f, "seek");
+  };
+  // A raccoon hunting this frog, and how likely the frog is to notice it
+  // this frame (see FROG_NOTICE).
+  const frogHunter = (f, dt) => {
+    const r = ducks.find((o) => o.active && o.coon && o.prey === f);
+    if (!r) return null;
+    // (How near its mouth is.)
+    const mx = r.x + Math.cos(r.heading) * COON_MOUTH * r.size;
+    const my = r.y + Math.sin(r.heading) * COON_MOUTH * r.size;
+    const near = Math.max(0, 1 - Math.hypot(f.x - mx, f.y - my) / RACCOON_NOTICE);
+    const rate = r.mode === "lunge" ? FROG_NOTICE.lunge : r.mode === "crouch" ? FROG_NOTICE.crouch : r.mode === "stalk" ? FROG_NOTICE.stalk * near : 0;
+    return { away: Math.atan2(f.y - r.y, f.x - r.x), chance: rate * dt };
+  };
+  // Riding its pad (from the GPU's answers). True if something disturbs it:
+  // the pad moving faster than FROG_SPOOK or drifting FROG_SHIFT from where
+  // it settled (its own landing ripple settles first), or no longer a pad.
+  const ride = (f, dt) => {
+    if (f.watch && f.watch.id === -2) return true;
+    const w = padNow(f, f.pad);
+    if (!w) return false;
+    f.x = w.x + f.ox;
+    f.y = w.y + f.oy;
+    if (f.landT < 1.2 || !f.base) {
+      f.base = { x: w.x, y: w.y };
+      return false;
+    }
+    const k = 1 - Math.exp(-dt * 0.3);
+    f.base.x += (w.x - f.base.x) * k;
+    f.base.y += (w.y - f.base.y) * k;
+    return w.speed > FROG_SPOOK || Math.hypot(w.x - f.base.x, w.y - f.base.y) > FROG_SHIFT;
+  };
+  const updateFrog = (f, i, dt, t, now) => {
+    f.age += dt;
+    f.modeT += dt;
+    f.landT += dt;
+    f.looking = false;
+    let ask = -1; // (the pad to watch)
+    let probe = null; // (a viewport point to ask about)
+    if (f.eaten > 0) {
+      // Caught: drawn into the raccoon's mouth, shrinking away to nothing.
+      const R = ducks[f.by];
+      f.eaten += dt;
+      const k = 1 - Math.exp(-dt * 18);
+      f.x += (R.x + Math.cos(R.heading) * COON_MOUTH * R.size - f.x) * k;
+      f.y += (R.y + Math.sin(R.heading) * COON_MOUTH * R.size - f.y) * k;
+      f.size = 0.97 * Math.max(0, 1 - (f.eaten / 0.45) ** 2);
+      if (f.eaten > 0.5) f.active = false;
+      probeAsk[i].set(-1e5, -1e5, -1, 0);
+      return;
+    }
+    // The page was laid out again: pads have new ids. (Quietly under.)
+    if ((f.pad >= 0 || f.goal >= 0) && f.gen !== layoutGen && f.mode !== "under") {
+      Object.assign(f, { pad: -1, goal: -1, onto: -1 });
+      if (f.mode !== "leap") setFrog(f, "dive");
+    }
+    // A raccoon after it: if it notices (and once that sinks in, a moment
+    // later), it's off into the water.
+    if (frogExposed(f) && !f.panic) {
+      const h = frogHunter(f, dt);
+      if (h && f.react < 0 && Math.random() < h.chance) f.react = between(...FROG_REACT);
+      if (f.react >= 0) {
+        f.react -= dt;
+        if (f.react < 0) startle(f, "noticed a raccoon", h ? h.away : null);
+      }
+    }
+
+    if (f.mode === "under") {
+      f.vis = 0;
+      if (f.modeT > f.underFor) {
+        if (f.laps >= f.maxLaps || f.age > 100 || f.modeT > f.underFor + 10) {
+          f.active = false;
+          probeAsk[i].set(-1e5, -1e5, -1, 0);
+          return;
+        }
+        const r = surfaceSearch(f, now);
+        if (r === "ok") {
+          // Out it leaps, onto the pad.
+          const c = f.cand;
+          f.cand = null;
+          Object.assign(f, { x: c.x, y: c.y, px: c.x, py: c.y, gen: layoutGen, sub: 1, legs: 0, alt: 0, pad: -1 });
+          rollHops(f);
+          aimAtPad(f, c.pad);
+          leap(f);
+        } else probe = r;
+      }
+    } else if (f.mode === "aim") {
+      // Turning to face where it'll leap (tracking a pad it's going for).
+      const n = f.next;
+      if (n.onto >= 0) {
+        ask = n.onto;
+        const w = padNow(f, n.onto);
+        if (w) {
+          n.x = w.x + n.ox;
+          n.y = w.y + n.oy;
+        }
+      }
+      const want = Math.atan2(n.y - f.y, n.x - f.x);
+      f.heading += angleTo(want, f.heading) * (1 - Math.exp(-dt * 14));
+      if (f.modeT > (f.panic ? 0.06 : 0.25) && Math.abs(angleTo(want, f.heading)) < 0.4) leap(f);
+    } else if (f.mode === "leap") {
+      if (f.onto >= 0) {
+        ask = f.onto;
+        if (f.watch && f.watch.id === -2) f.onto = -1; // (no longer a pad: in it goes)
+        else {
+          const w = padNow(f, f.onto);
+          if (w) {
+            // (The pad drifts: the leap ends wherever it is now.)
+            f.tx = w.x + f.ox;
+            f.ty = w.y + f.oy;
+          }
+        }
+      }
+      const u = Math.min(f.modeT / f.leapFor, 1);
+      f.x = f.sx + (f.tx - f.sx) * u;
+      f.y = f.sy + (f.ty - f.sy) * u;
+      f.alt = 4 * f.leapH * u * (1 - u);
+      // (Legs kick out at once, and fold back as it comes down on a pad.)
+      f.legs = u < 0.15 ? u / 0.15 : f.onto >= 0 && u > 0.65 ? Math.max(0, 1 - (u - 0.65) / 0.3) : 1;
+      f.sub = f.fromWater ? Math.max(0, 1 - u / 0.15) : 0;
+      f.vis = 1;
+      if (u >= 1) {
+        f.alt = 0;
+        if (f.onto >= 0) {
+          Object.assign(f, { pad: f.onto, goal: -1, onto: -1, base: null, landT: 0, legs: 0, gen: layoutGen, sitFor: between(...FROG_SIT), panic: false });
+          f.hops++;
+          ring(f.x - f.ox, f.y - f.oy, f.padR * 0.9, FROG_RIPPLE.onPad);
+          setFrog(f, "sit");
+        } else {
+          ring(f.x, f.y, 8, FROG_RIPPLE.plop);
+          setFrog(f, "dive");
+        }
+      }
+    } else if (f.mode === "sit") {
+      ask = f.pad;
+      // (Glancing about now and then.)
+      f.heading += Math.sin(t * 0.6 + f.phase) * 0.12 * dt;
+      if (ride(f, dt)) startle(f, "its pad moved");
+      else if (f.modeT > f.sitFor) {
+        if (f.hops >= f.maxHops || f.age > 90) setFrog(f, "seek");
+        else {
+          const r = padSearch(f, now);
+          if (r.pad) aimAtPad(f, r.pad);
+          else {
+            probe = r.probe;
+            if (f.modeT > f.sitFor + 3) setFrog(f, "seek");
+          }
+        }
+      }
+    } else if (f.mode === "seek") {
+      // Done here (or startled): find open water to leap into.
+      ask = f.pad;
+      if (ride(f, dt) && !f.panic) Object.assign(f, { panic: true });
+      // (Startled, it leaps at once, without turning first: it only checks
+      // the water for a blink.)
+      const go = (x, y) => {
+        aimAt(f, x, y, -1);
+        if (f.panic) leap(f);
+        f.cand = null;
+      };
+      const r = waterSearch(f, now);
+      if (r === "ok") go(f.cand.x, f.cand.y);
+      else if (r) probe = r;
+      if (f.mode === "seek" && (f.modeT > 3 || (f.panic && f.modeT > 0.1))) {
+        // (Nowhere checked in time: it just goes.)
+        const a = f.flee !== null ? f.flee : Math.random() * Math.PI * 2;
+        go(f.x - f.ox + Math.cos(a) * (f.padR + 30), f.y - f.oy + Math.sin(a) * (f.padR + 30));
+      }
+    } else if (f.mode === "dive") {
+      f.sub = Math.min(1, f.sub + dt / 0.12);
+      f.legs = Math.max(0, f.legs - dt / 0.2);
+      f.vis = Math.max(0, f.vis - dt / (f.mode === "dive" ? 0.2 : 0.3));
+      if (f.vis <= 0) {
+        Object.assign(f, { laps: f.laps + 1, hops: 0, goal: -1, pad: -1, underFor: between(2, 5), panic: false, flee: null, cand: null, react: -1 });
+        setFrog(f, "under");
+      }
+    }
+    // (How fast it's going, for a raccoon leading its lunge.)
+    const k = 1 - Math.exp(-dt * 10);
+    f.vx += ((f.x - f.px) / Math.max(dt, 1e-3) - f.vx) * k;
+    f.vy += ((f.y - f.py) / Math.max(dt, 1e-3) - f.vy) * k;
+    if (f.mode === "under") f.vx = f.vy = 0;
+    f.px = f.x;
+    f.py = f.y;
+    probeAsk[i].set(probe ? probe[0] : -1e5, probe ? probe[1] : -1e5, ask, 0);
+  };
+  const updateFrogs = (dt, t) => {
+    nextFrog -= dt;
+    if (nextFrog <= 0) {
+      const f = frogs.find((o) => !o.active);
+      if (f) spawnFrog(f);
+      nextFrog = between(...FROG_EVERY);
+    }
+    const now = performance.now();
+    frogs.forEach((f, j) => {
+      const i = MAX_FLIES + j;
+      if (f.active) updateFrog(f, i, dt, t, now);
+      if (!f.active) {
+        frogB[j].set(-1, 0, 0, -1);
+        frogC[j].set(0, 0, 0, 1);
+        probeAsk[i].set(-1e5, -1e5, -1, 0);
+        return;
+      }
+      frogA[j].set(f.x - scrollX, f.y - scrollY, f.heading, f.alt);
+      frogB[j].set(f.pad >= 0 ? f.pad : -1, f.ox, f.oy, 1);
+      frogC[j].set(f.legs, f.sub, f.vis, f.size);
+    });
+    if (frogTest)
+      window.__frogs = frogs.map(
+        (f) =>
+          f.active && { x: f.x - scrollX, y: f.y - scrollY, mode: f.mode, pad: f.pad, goal: f.goal, hops: f.hops, laps: f.laps, vis: f.vis, why: f.why, eaten: f.eaten },
+      );
   };
 
   // ------------------------------------------------------------------- loop
@@ -3287,6 +3856,7 @@ async function main() {
     writeGroups(false);
     updateDucks(dt, uTime.value);
     updateFlies(dt, uTime.value);
+    updateFrogs(dt, uTime.value);
 
     // Waves: as few steps per frame as the fast layer's stability limit
     // allows (one at 120fps, two at 60fps); a step is capped at that limit,
@@ -3317,16 +3887,17 @@ async function main() {
     if (gpuTime) {
       renderer.compute([...waveWork, facetUpdate, facetSpread]);
       renderer.compute([fieldUpdate, nodeUpdate]);
-      renderer.compute([pixelStage.clear, pixelStage.seed, pixelStage.padScatter, ...pixelStage.passes, pixelStage.neighbours, pixelStage.padEdgePass, pixelStage.flyProbe]);
+      renderer.compute([pixelStage.clear, pixelStage.seed, pixelStage.padScatter, ...pixelStage.passes, pixelStage.neighbours, pixelStage.padEdgePass, pixelStage.padProbe]);
     } else {
-      renderer.compute([...waveWork, facetUpdate, facetSpread, fieldUpdate, nodeUpdate, pixelStage.clear, pixelStage.seed, pixelStage.padScatter, ...pixelStage.passes, pixelStage.neighbours, pixelStage.padEdgePass, pixelStage.flyProbe]);
+      renderer.compute([...waveWork, facetUpdate, facetSpread, fieldUpdate, nodeUpdate, pixelStage.clear, pixelStage.seed, pixelStage.padScatter, ...pixelStage.passes, pixelStage.neighbours, pixelStage.padEdgePass, pixelStage.padProbe]);
     }
     uWaveReset.value = 0;
     if (ducks.some((d) => d.active)) readDuckWaves();
-    if (flies.some((f) => f.active)) readFlies();
+    if (flies.some((f) => f.active) || frogs.some((f) => f.active)) readProbes();
     pixelStage.quad.render(renderer);
     pixelStage.pads.geometry.instanceCount = nodeCount;
     flyMesh.visible = flies.some((f) => f.active);
+    frogMesh.visible = frogs.some((f) => f.active);
     renderer.render(pixelStage.pads.scene, padCamera);
     if (gpuTime && (gpuFrame = (gpuFrame || 0) + 1) % 30 === 0) {
       Promise.all([renderer.resolveTimestampsAsync(THREE.TimestampQuery.COMPUTE), renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER)]).then(([c, r]) => {
